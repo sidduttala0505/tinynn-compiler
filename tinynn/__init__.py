@@ -1,10 +1,12 @@
 """TinyNN: a tiny compiler for simple neural networks.
 
-Phase 0, Step 1 exposes only the shared Graph IR.
+Tier 0 exposes the shared Graph IR, the NumPy reference interpreter, and the
+C++ code generator / compiler driver.
 """
 
 from __future__ import annotations
 
+from .codegen import CompiledModel, compile_graph, generate_cpp
 from .graph import (
     INPUT,
     LINEAR,
@@ -15,6 +17,7 @@ from .graph import (
     GraphBuilder,
     Node,
 )
+from .interpreter import run
 
 __all__ = [
     "INPUT",
@@ -25,4 +28,8 @@ __all__ = [
     "Node",
     "Graph",
     "GraphBuilder",
+    "run",
+    "CompiledModel",
+    "compile_graph",
+    "generate_cpp",
 ]
