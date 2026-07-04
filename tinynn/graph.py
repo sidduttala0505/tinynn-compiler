@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .ops import INPUT, LINEAR, OUTPUT, RELU, SUPPORTED_OPS
+from .ops import FUSED_LINEAR_RELU, INPUT, LINEAR, OUTPUT, RELU, SUPPORTED_OPS
 
 # Re-export op constants so callers can simply ``from tinynn.graph import LINEAR``.
 __all__ = [
@@ -43,6 +43,7 @@ __all__ = [
     "LINEAR",
     "RELU",
     "OUTPUT",
+    "FUSED_LINEAR_RELU",
     "SUPPORTED_OPS",
     "Node",
     "Graph",
@@ -126,7 +127,7 @@ class Node:
         elif self.op == OUTPUT:
             self._require_single_input()
             self._require_no_weights()
-        elif self.op == LINEAR:
+        elif self.op in (LINEAR, FUSED_LINEAR_RELU):
             self._validate_linear()
 
     def _require_no_inputs(self) -> None:
@@ -254,7 +255,7 @@ class Graph:
 
         # Shape compatibility between connected nodes.
         for node in self.nodes:
-            if node.op == LINEAR:
+            if node.op in (LINEAR, FUSED_LINEAR_RELU):
                 src = node_by_name[node.inputs[0]]
                 in_features = int(node.weight.shape[0])
                 if src.shape != (in_features,):
@@ -365,6 +366,23 @@ class GraphBuilder:
             Node(
                 name=name,
                 op=LINEAR,
+                inputs=(input_name,),
+                shape=out_features,
+                weight=weight,
+                bias=bias,
+            )
+        )
+        return name
+
+    def fused_linear_relu(
+        self, name: str, input_name: str, weight: np.ndarray, bias: np.ndarray
+    ) -> str:
+        weight = np.asarray(weight, dtype=DTYPE)
+        out_features = (int(weight.shape[1]),) if weight.ndim == 2 else ()
+        self._nodes.append(
+            Node(
+                name=name,
+                op=FUSED_LINEAR_RELU,
                 inputs=(input_name,),
                 shape=out_features,
                 weight=weight,

@@ -13,7 +13,7 @@ from typing import Dict, Union
 import numpy as np
 
 from .graph import Graph, Node
-from .ops import INPUT, LINEAR, OUTPUT, RELU
+from .ops import FUSED_LINEAR_RELU, INPUT, LINEAR, OUTPUT, RELU
 
 Inputs = Union[Dict[str, np.ndarray], np.ndarray]
 
@@ -37,6 +37,9 @@ def run(graph: Graph, inputs: Inputs) -> np.ndarray:
         elif node.op == RELU:
             x = _single_input_value(node, values)
             values[node.name] = np.maximum(x, 0.0)
+        elif node.op == FUSED_LINEAR_RELU:
+            x = _single_input_value(node, values)
+            values[node.name] = np.maximum(x @ node.weight + node.bias, 0.0)
         elif node.op == OUTPUT:
             values[node.name] = _single_input_value(node, values)
         else:

@@ -27,7 +27,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from .graph import Graph, INPUT, LINEAR, OUTPUT, RELU
+from .graph import FUSED_LINEAR_RELU, Graph, INPUT, LINEAR, OUTPUT, RELU
 
 __all__ = [
     "sanitize_name",
@@ -87,7 +87,7 @@ def _build_identifier_map(graph: Graph) -> Dict[str, str]:
 # --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #
-_SUPPORTED = {INPUT, LINEAR, RELU, OUTPUT}
+_SUPPORTED = {INPUT, LINEAR, RELU, OUTPUT, FUSED_LINEAR_RELU}
 
 
 def _validate_for_codegen(graph: Graph) -> None:
@@ -170,15 +170,15 @@ def generate_cpp(graph: Graph) -> str:
     lines.append("#include <algorithm>")
     lines.append("")
 
-    # Global static weight/bias arrays for Linear nodes.
+    # Global static weight/bias arrays for Linear (and FusedLinearReLU) nodes.
     for node in graph.nodes:
-        if node.op != LINEAR:
+        if node.op not in (LINEAR, FUSED_LINEAR_RELU):
             continue
         ident = ids[node.name]
         in_features, out_features = node.weight.shape
         w_body = _format_double_array(node.weight)
         b_body = _format_double_array(node.bias)
-        lines.append(f"// Linear node {node.name!r}: in_features={in_features}, out_features={out_features}")
+        lines.append(f"// {node.op} node {node.name!r}: in_features={in_features}, out_features={out_features}")
         lines.append(f"static const std::vector<double> {ident}_w = {{")
         lines.append(w_body)
         lines.append("};")
@@ -230,6 +230,20 @@ def generate_cpp(graph: Graph) -> str:
             lines.append(f"    std::vector<double> {ident}({n});")
             lines.append(f"    for (int i = 0; i < {n}; ++i) {{")
             lines.append(f"        {ident}[i] = std::max(0.0, {src_ident}[i]);")
+            lines.append("    }")
+            lines.append("")
+
+        elif node.op == FUSED_LINEAR_RELU:
+            src_ident = ids[node.inputs[0]]
+            in_features, out_features = node.weight.shape
+            lines.append(f"    // FusedLinearReLU node {node.name!r}")
+            lines.append(f"    std::vector<double> {ident}({out_features});")
+            lines.append(f"    for (int j = 0; j < {out_features}; ++j) {{")
+            lines.append(f"        double acc = {ident}_b[j];")
+            lines.append(f"        for (int i = 0; i < {in_features}; ++i) {{")
+            lines.append(f"            acc += {src_ident}[i] * {ident}_w[i * {out_features} + j];")
+            lines.append("        }")
+            lines.append(f"        {ident}[j] = std::max(0.0, acc);")
             lines.append("    }")
             lines.append("")
 
