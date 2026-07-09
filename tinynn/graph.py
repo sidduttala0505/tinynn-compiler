@@ -35,7 +35,23 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .ops import FUSED_LINEAR_RELU, INPUT, LINEAR, OUTPUT, RELU, SUPPORTED_OPS
+from .ops import (
+    ADD,
+    CONST,
+    FUSED_LINEAR_RELU,
+    INPUT,
+    LINEAR,
+    MATMUL,
+    MUL,
+    OUTPUT,
+    QUANTIZED_LINEAR,
+    RELU,
+    SIGMOID,
+    SOFTMAX,
+    SUB,
+    SUPPORTED_OPS,
+    TANH,
+)
 
 # Re-export op constants so callers can simply ``from tinynn.graph import LINEAR``.
 __all__ = [
@@ -44,6 +60,15 @@ __all__ = [
     "RELU",
     "OUTPUT",
     "FUSED_LINEAR_RELU",
+    "ADD",
+    "SUB",
+    "MUL",
+    "MATMUL",
+    "SOFTMAX",
+    "TANH",
+    "SIGMOID",
+    "CONST",
+    "QUANTIZED_LINEAR",
     "SUPPORTED_OPS",
     "Node",
     "Graph",
@@ -127,8 +152,16 @@ class Node:
         elif self.op == OUTPUT:
             self._require_single_input()
             self._require_no_weights()
-        elif self.op in (LINEAR, FUSED_LINEAR_RELU):
+        elif self.op in (LINEAR, FUSED_LINEAR_RELU, QUANTIZED_LINEAR):
             self._validate_linear()
+        elif self.op in (ADD, SUB, MUL, MATMUL):
+            self._require_two_inputs()
+            self._require_no_weights()
+        elif self.op in (SOFTMAX, TANH, SIGMOID):
+            self._require_single_input()
+            self._require_no_weights()
+        elif self.op == CONST:
+            self._validate_const()
 
     def _require_no_inputs(self) -> None:
         if self.inputs:
@@ -138,6 +171,12 @@ class Node:
         if len(self.inputs) != 1:
             raise ValueError(
                 f"{self.op} node {self.name} must have exactly one input, got {list(self.inputs)}"
+            )
+
+    def _require_two_inputs(self) -> None:
+        if len(self.inputs) != 2:
+            raise ValueError(
+                f"{self.op} node {self.name} must have exactly two inputs, got {list(self.inputs)}"
             )
 
     def _require_no_weights(self) -> None:
@@ -168,6 +207,23 @@ class Node:
             raise ValueError(
                 f"Linear node {self.name} shape {self.shape} must equal "
                 f"weight output shape {expected_shape}"
+            )
+
+    def _validate_const(self) -> None:
+        self._require_no_inputs()
+        if self.weight is None:
+            raise ValueError(f"Const node {self.name} must have a weight (its value)")
+        if self.bias is not None:
+            raise ValueError(f"Const node {self.name} must not have a bias")
+        if self.weight.ndim not in (1, 2):
+            raise ValueError(
+                f"Const node {self.name} weight must be 1D or 2D, got shape {self.weight.shape}"
+            )
+        expected_shape = tuple(int(d) for d in self.weight.shape)
+        if self.shape != expected_shape:
+            raise ValueError(
+                f"Const node {self.name} shape {self.shape} must equal "
+                f"weight shape {expected_shape}"
             )
 
     # -- serialization ----------------------------------------------------- #
@@ -255,7 +311,7 @@ class Graph:
 
         # Shape compatibility between connected nodes.
         for node in self.nodes:
-            if node.op in (LINEAR, FUSED_LINEAR_RELU):
+            if node.op in (LINEAR, FUSED_LINEAR_RELU, QUANTIZED_LINEAR):
                 src = node_by_name[node.inputs[0]]
                 in_features = int(node.weight.shape[0])
                 if src.shape != (in_features,):
@@ -264,6 +320,59 @@ class Graph:
                         f"but weight has input dimension {in_features}"
                     )
             elif node.op in (RELU, OUTPUT):
+                src = node_by_name[node.inputs[0]]
+                if node.shape != src.shape:
+                    raise ValueError(
+                        f"{node.op} node {node.name} shape {node.shape} must equal "
+                        f"input node {src.name} shape {src.shape}"
+                    )
+            elif node.op in (ADD, SUB, MUL):
+                a = node_by_name[node.inputs[0]]
+                b = node_by_name[node.inputs[1]]
+                if a.shape != b.shape:
+                    raise ValueError(
+                        f"{node.op} node {node.name} inputs must have equal shapes, "
+                        f"got {a.name} shape {a.shape} and {b.name} shape {b.shape}"
+                    )
+                if node.shape != a.shape:
+                    raise ValueError(
+                        f"{node.op} node {node.name} shape {node.shape} must equal "
+                        f"input shape {a.shape}"
+                    )
+            elif node.op == MATMUL:
+                a = node_by_name[node.inputs[0]]
+                b = node_by_name[node.inputs[1]]
+                if len(a.shape) != 2 or len(b.shape) != 2:
+                    raise ValueError(
+                        f"MatMul node {node.name} inputs must both be 2D, got "
+                        f"{a.name} shape {a.shape} and {b.name} shape {b.shape}"
+                    )
+                m, k = a.shape
+                k2, n = b.shape
+                if k != k2:
+                    raise ValueError(
+                        f"MatMul node {node.name} inner dimensions must match, "
+                        f"got {a.name} shape {a.shape} and {b.name} shape {b.shape}"
+                    )
+                if node.shape != (m, n):
+                    raise ValueError(
+                        f"MatMul node {node.name} shape {node.shape} must equal "
+                        f"({m}, {n}) from inputs {a.name} shape {a.shape} and "
+                        f"{b.name} shape {b.shape}"
+                    )
+            elif node.op == SOFTMAX:
+                src = node_by_name[node.inputs[0]]
+                if len(src.shape) != 1:
+                    raise ValueError(
+                        f"Softmax node {node.name} input {src.name} must be 1D, "
+                        f"got shape {src.shape}"
+                    )
+                if node.shape != src.shape:
+                    raise ValueError(
+                        f"Softmax node {node.name} shape {node.shape} must equal "
+                        f"input node {src.name} shape {src.shape}"
+                    )
+            elif node.op in (TANH, SIGMOID):
                 src = node_by_name[node.inputs[0]]
                 if node.shape != src.shape:
                     raise ValueError(
@@ -374,6 +483,28 @@ class GraphBuilder:
         )
         return name
 
+    def quantized_linear(
+        self, name: str, input_name: str, weight: np.ndarray, bias: np.ndarray
+    ) -> str:
+        """Add a ``QuantizedLinear`` node (see :mod:`tinynn.ops` for semantics).
+
+        Stores the ORIGINAL float64 weight/bias, identically to ``linear``;
+        quantization happens deterministically at eval/codegen time, not here.
+        """
+        weight = np.asarray(weight, dtype=DTYPE)
+        out_features = (int(weight.shape[1]),) if weight.ndim == 2 else ()
+        self._nodes.append(
+            Node(
+                name=name,
+                op=QUANTIZED_LINEAR,
+                inputs=(input_name,),
+                shape=out_features,
+                weight=weight,
+                bias=bias,
+            )
+        )
+        return name
+
     def fused_linear_relu(
         self, name: str, input_name: str, weight: np.ndarray, bias: np.ndarray
     ) -> str:
@@ -402,6 +533,64 @@ class GraphBuilder:
             Node(name=name, op=OUTPUT, inputs=(input_name,), shape=self._shape_of(input_name))
         )
         self._last_output = name
+        return name
+
+    def add(self, name: str, a: str, b: str) -> str:
+        self._nodes.append(
+            Node(name=name, op=ADD, inputs=(a, b), shape=self._shape_of(a))
+        )
+        return name
+
+    def sub(self, name: str, a: str, b: str) -> str:
+        self._nodes.append(
+            Node(name=name, op=SUB, inputs=(a, b), shape=self._shape_of(a))
+        )
+        return name
+
+    def mul(self, name: str, a: str, b: str) -> str:
+        self._nodes.append(
+            Node(name=name, op=MUL, inputs=(a, b), shape=self._shape_of(a))
+        )
+        return name
+
+    def matmul(self, name: str, a: str, b: str) -> str:
+        a_shape = self._shape_of(a)
+        b_shape = self._shape_of(b)
+        out_shape = (a_shape[0], b_shape[1]) if len(a_shape) == 2 and len(b_shape) == 2 else ()
+        self._nodes.append(
+            Node(name=name, op=MATMUL, inputs=(a, b), shape=out_shape)
+        )
+        return name
+
+    def softmax(self, name: str, x: str) -> str:
+        self._nodes.append(
+            Node(name=name, op=SOFTMAX, inputs=(x,), shape=self._shape_of(x))
+        )
+        return name
+
+    def tanh(self, name: str, x: str) -> str:
+        self._nodes.append(
+            Node(name=name, op=TANH, inputs=(x,), shape=self._shape_of(x))
+        )
+        return name
+
+    def sigmoid(self, name: str, x: str) -> str:
+        self._nodes.append(
+            Node(name=name, op=SIGMOID, inputs=(x,), shape=self._shape_of(x))
+        )
+        return name
+
+    def const(self, name: str, value: np.ndarray) -> str:
+        value = np.asarray(value, dtype=DTYPE)
+        self._nodes.append(
+            Node(
+                name=name,
+                op=CONST,
+                inputs=(),
+                shape=tuple(int(d) for d in value.shape),
+                weight=value,
+            )
+        )
         return name
 
     # -- finalize ---------------------------------------------------------- #

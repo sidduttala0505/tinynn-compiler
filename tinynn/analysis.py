@@ -12,6 +12,9 @@ and :class:`~tinynn.graph.Graph` objects but do not modify existing modules:
 Shape inference rules
 ----------------------
 * ``Input`` nodes: shape is whatever was declared on the node.
+* ``Const`` nodes: shape is ``weight.shape`` (1D or 2D). Checked before the
+  "2D weight => Linear-like" rule below, since a Const's value also lives in
+  ``weight`` but it has no inputs.
 * Any node with a 2D ``weight`` (i.e. "Linear-like" -- covers ``Linear`` and any
   future fused op such as ``FusedLinearReLU``): output shape is
   ``(weight.shape[1],)``, and the single input's inferred shape must equal
@@ -25,7 +28,7 @@ from __future__ import annotations
 from typing import Dict, List, Tuple
 
 from .graph import Graph, Node
-from .ops import INPUT
+from .ops import ADD, CONST, INPUT, MATMUL, MUL, SOFTMAX, SUB
 
 
 def topological_sort(nodes) -> Tuple[Node, ...]:
@@ -111,6 +114,12 @@ def infer_shapes(graph: Graph) -> Dict[str, Tuple[int, ...]]:
     for node in graph.nodes:
         if node.op == INPUT:
             shape = node.shape
+        elif node.op == CONST:
+            # Must come before the "2D weight => Linear-like" branch below: a
+            # 2D Const's value lives in `weight` too, but it has zero inputs
+            # and would otherwise be misclassified as Linear-like and crash
+            # trying to look up a nonexistent input's inferred shape.
+            shape = node.weight.shape
         elif node.weight is not None and node.weight.ndim == 2:
             # Linear-like: Linear, or any future op with a 2D weight
             # (e.g. FusedLinearReLU).
@@ -129,6 +138,58 @@ def infer_shapes(graph: Graph) -> Dict[str, Tuple[int, ...]]:
                     f"{src_shape}"
                 )
             shape = (int(node.weight.shape[1]),)
+        elif node.op in (ADD, SUB, MUL):
+            if len(node.inputs) != 2:
+                raise ValueError(
+                    f"{node.op} node {node.name!r} must have exactly two "
+                    f"inputs, got {list(node.inputs)}"
+                )
+            a_name, b_name = node.inputs[0], node.inputs[1]
+            a_shape = inferred[a_name]
+            b_shape = inferred[b_name]
+            if a_shape != b_shape:
+                raise ValueError(
+                    f"{node.op} node {node.name!r} inputs must have equal "
+                    f"shapes, got {a_name!r} shape {a_shape} and {b_name!r} "
+                    f"shape {b_shape}"
+                )
+            shape = a_shape
+        elif node.op == MATMUL:
+            if len(node.inputs) != 2:
+                raise ValueError(
+                    f"MatMul node {node.name!r} must have exactly two "
+                    f"inputs, got {list(node.inputs)}"
+                )
+            a_name, b_name = node.inputs[0], node.inputs[1]
+            a_shape = inferred[a_name]
+            b_shape = inferred[b_name]
+            if len(a_shape) != 2 or len(b_shape) != 2:
+                raise ValueError(
+                    f"MatMul node {node.name!r} inputs must both be 2D, got "
+                    f"{a_name!r} shape {a_shape} and {b_name!r} shape {b_shape}"
+                )
+            m, k = a_shape
+            k2, n = b_shape
+            if k != k2:
+                raise ValueError(
+                    f"MatMul node {node.name!r} inner dimensions must match, "
+                    f"got {a_name!r} shape {a_shape} and {b_name!r} shape {b_shape}"
+                )
+            shape = (m, n)
+        elif node.op == SOFTMAX:
+            if len(node.inputs) != 1:
+                raise ValueError(
+                    f"Softmax node {node.name!r} must have exactly one "
+                    f"input, got {list(node.inputs)}"
+                )
+            src_name = node.inputs[0]
+            src_shape = inferred[src_name]
+            if len(src_shape) != 1:
+                raise ValueError(
+                    f"Softmax node {node.name!r} input {src_name!r} must be "
+                    f"1D, got shape {src_shape}"
+                )
+            shape = src_shape
         else:
             # Weight-less single-input op (ReLU, Output, or any future op of
             # the same shape-preserving kind).

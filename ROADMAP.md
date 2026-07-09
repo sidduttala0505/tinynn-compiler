@@ -11,54 +11,82 @@
 - Basic C++ codegen + g++ compile/run wrapper (`tinynn/codegen.py`)
 - Correctness tests comparing compiled C++ against the interpreter
 
-## Tier 1 — Graph infrastructure
+## Tier 1 — Graph infrastructure ✅ (complete)
 
-- [ ] Topological sort (accept unordered node lists, detect cycles)
-- [ ] Shape inference (standalone shape-rule reference / consistency check)
-- [ ] Graph serialization to/from JSON files
-- [ ] Graph visualization (Graphviz DOT export)
+- [x] Topological sort (accept unordered node lists, detect cycles) — `tinynn/analysis.py`
+- [x] Shape inference (standalone shape-rule reference / consistency check) — `tinynn/analysis.py`
+- [x] Graph serialization to/from JSON files — `tinynn/serialize.py`
+- [x] Graph visualization (Graphviz DOT export) — `tinynn/viz.py`
 
-## Tier 2 — More operators (only when needed)
+## Tier 2 — More operators ✅ (complete)
 
-- [ ] Elementwise Add / Sub / Mul (requires multi-input node semantics)
-- [ ] MatMul
-- [ ] Softmax and/or LayerNorm if feasible
+- [x] Elementwise Add / Sub / Mul (multi-input node semantics, same-shape,
+      1D or 2D)
+- [x] MatMul (2D x 2D; 2D tensors + multiple Input nodes supported end-to-end
+      in IR, interpreter, and codegen)
+- [x] Softmax (numerically stable), plus Tanh and Sigmoid
+- [ ] LayerNorm (deferred)
 
-## Tier 3 — Optimizer structure
+## Tier 3 — Optimizer structure ✅ (complete)
 
-- [ ] Pass manager (passes are pure `Graph -> Graph` functions)
-- [ ] Dead code elimination
-- [ ] Linear + ReLU -> FusedLinearReLU fusion (op supported in IR,
+- [x] Pass manager (passes are pure `Graph -> Graph` functions) — `tinynn/passes.py`
+- [x] Dead code elimination — `tinynn/passes.py`
+- [x] Linear + ReLU -> FusedLinearReLU fusion (op supported in IR,
       interpreter, and codegen)
-- [ ] Constant folding / algebraic simplification (needs a Const op first)
+- [x] Const op (value stored in `weight`) + constant folding + algebraic
+      simplification (add/sub-zero, mul-one, ReLU idempotence); default
+      pipeline is now fold -> simplify -> DCE -> fuse
 
-## Tier 4 — CPU codegen performance
+## Tier 4 — CPU codegen performance ✅ (complete)
 
-- [ ] Loop tiling / blocking
-- [ ] SIMD hints / vectorization-friendly codegen
-- [ ] OpenMP multithreading
-- [ ] Memory planning / buffer reuse
+- [x] Loop interchange + cache-blocked tiling for Linear / FusedLinearReLU /
+      MatMul (`CodegenOptions(tile_size=...)`, `CodegenOptions.fast()`)
+- [x] Vectorization-friendly codegen (`-O3 -march=native` via options; the
+      interchanged loops stream memory row-major)
+- [x] OpenMP multithreading (option-gated, race-free pragma placement,
+      `openmp_available()` probe; unavailable on the current dev machine's
+      Apple clang, so it is tested via a cleanly-skipped test)
+- [x] Repeat/warmup timing mode inside generated binaries + benchmark
+      harness (`tinynn/benchmark.py`, results in `results/`)
+- [x] Memory planning / buffer reuse (`CodegenOptions(reuse_buffers=True)`:
+      liveness-based exact-size slot planner; e.g. 5 logical buffers -> 2
+      physical slots on an MLP chain)
 
-## Tier 5 — GPU (deferred until CPU story is solid)
+## Tier 5 — GPU (blocked on environment)
 
-- [ ] CUDA backend
+- [ ] CUDA backend — BLOCKED: the development machine (arm64 macOS) has no
+      nvcc/CUDA toolchain, so a GPU backend cannot be compiled or verified
+      against the interpreter oracle here. `tests/test_cuda.py` skips cleanly
+      without nvcc and fails loudly on a CUDA-capable machine until a real
+      backend exists (it never silently passes).
 
-## Tier 6 — Interchange / quantization (deferred)
+## Tier 6 — Interchange / quantization (mostly complete)
 
-- [ ] ONNX import
-- [ ] int8 quantization
+- [x] ONNX import (`tinynn/onnx_import.py`, optional `onnx` dependency):
+      MLP-style models — Gemm/MatMul/Relu/Tanh/Sigmoid/Softmax/Add/Sub/Mul/
+      Identity, 1D activations with batch-1 squeeze; clear errors otherwise
+- [x] int8 quantization (`QuantizedLinear` op + `quantize_linear` pass):
+      real int8 inference — symmetric weight quantization, dynamic per-call
+      activation quantization, int64 accumulation, float rescale; identical
+      rounding semantics in interpreter and C++ so the quantized paths
+      compare exactly. Opt-in (not in the default pipeline)
+- [ ] Quantized FusedLinearReLU, batched/2D ONNX activations (future work)
 
-## Tier 7 — Rigor
+## Tier 7 — Rigor ✅ (complete for current ops; extend alongside new ops)
 
-- [ ] Randomized (seeded) graph fuzzing: interpreter vs compiled C++,
-      and optimized vs unoptimized graphs
-- [ ] Stronger correctness suite across all ops and passes
+- [x] Randomized (seeded) graph fuzzing: interpreter vs compiled C++,
+      and optimized vs unoptimized graphs — `tests/test_fuzz.py`
+- [x] General graph-shape fuzzing (branching, diamonds, multi-consumer,
+      dead branches, 2D tensors, full Tier 2 op set, 4-way comparison) —
+      `tests/test_fuzz_graphs.py`
+- [x] Stronger correctness suite across all ops and passes
 
-## Tier 8 — Demo / story
+## Tier 8 — Demo / story (partial)
 
-- [ ] End-to-end example (`examples/`): build → interpret → optimize →
-      compile → verify
-- [ ] Benchmark harness with results written to `results/`
+- [x] End-to-end example (`examples/`): build → interpret → optimize →
+      compile → verify — `examples/mlp_demo.py`
+- [x] Benchmark harness with results written to `results/`
+      (`python -m tinynn.benchmark`)
 - [ ] MNIST MLP demo if feasible
 
 ## Standing rules

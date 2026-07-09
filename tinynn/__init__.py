@@ -9,9 +9,25 @@ serialization, Graphviz DOT export).
 from __future__ import annotations
 
 from .analysis import infer_shapes, topological_sort
-from .codegen import CompiledModel, compile_graph, generate_cpp
+from .benchmark import benchmark_graph
+from .codegen import (
+    CodegenOptions,
+    CompiledModel,
+    compile_graph,
+    generate_cpp,
+    openmp_available,
+)
 from .graph import (
+    ADD,
+    CONST,
     FUSED_LINEAR_RELU,
+    MATMUL,
+    MUL,
+    QUANTIZED_LINEAR,
+    SIGMOID,
+    SOFTMAX,
+    SUB,
+    TANH,
     INPUT,
     LINEAR,
     OUTPUT,
@@ -22,11 +38,15 @@ from .graph import (
     Node,
 )
 from .interpreter import run
+from .onnx_import import import_onnx
 from .passes import (
     PassManager,
+    constant_folding,
     dead_code_elimination,
     default_pipeline,
     fuse_linear_relu,
+    quantize_linear,
+    simplify_algebraic,
 )
 from .serialize import load_json, save_json
 from .viz import save_dot, to_dot
@@ -41,14 +61,30 @@ __all__ = [
     "Node",
     "Graph",
     "GraphBuilder",
+    "ADD",
+    "SUB",
+    "MUL",
+    "MATMUL",
+    "SOFTMAX",
+    "TANH",
+    "SIGMOID",
     "run",
     "CompiledModel",
+    "CodegenOptions",
     "compile_graph",
     "generate_cpp",
+    "openmp_available",
+    "benchmark_graph",
+    "CONST",
+    "QUANTIZED_LINEAR",
     "PassManager",
+    "constant_folding",
+    "simplify_algebraic",
     "dead_code_elimination",
     "fuse_linear_relu",
+    "quantize_linear",
     "default_pipeline",
+    "import_onnx",
     "topological_sort",
     "infer_shapes",
     "save_json",

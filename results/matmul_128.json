@@ -1,0 +1,39 @@
+{
+  "label": "matmul_128",
+  "timestamp": "2026-07-07T22:57:25.055888+00:00",
+  "graph": {
+    "num_nodes": 3,
+    "ops": {
+      "Input": 2,
+      "MatMul": 1
+    },
+    "input_shapes": {
+      "a": [
+        128,
+        128
+      ],
+      "c": [
+        128,
+        128
+      ]
+    },
+    "output_shape": [
+      128,
+      128
+    ]
+  },
+  "iters": 200,
+  "warmup": 20,
+  "openmp_used": false,
+  "correctness_verified": true,
+  "timing_s_per_iter": {
+    "interpreter": 1.2885839999992044e-05,
+    "cpu_naive": 0.001265678125,
+    "cpu_optimized": 0.000483661665
+  },
+  "speedup": {
+    "naive_vs_interpreter": 0.010180977094782327,
+    "optimized_vs_naive": 2.6168667409272555,
+    "optimized_vs_interpreter": 0.02664226034947807
+  }
+}

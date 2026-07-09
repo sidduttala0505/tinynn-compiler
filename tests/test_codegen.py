@@ -195,27 +195,35 @@ def test_generate_cpp_sanitizes_identifiers():
 # --------------------------------------------------------------------------- #
 # Validation errors
 # --------------------------------------------------------------------------- #
-def test_generate_cpp_rejects_multiple_input_nodes():
+def test_generate_cpp_accepts_multiple_input_nodes():
+    # Multiple Input nodes are supported (Tier 2): each Input is read from
+    # stdin in graph order, so both sanitized identifiers must appear in the
+    # generated source.
     builder = GraphBuilder()
     x1 = builder.input("x1", shape=(2,))
-    builder.input("x2", shape=(2,))
-    w = np.array([[1.0, 0.0], [0.0, 1.0]])
-    b = np.array([0.0, 0.0])
-    l0 = builder.linear("linear_0", x1, weight=w, bias=b)
-    graph = builder.build(output_node=l0)
+    x2 = builder.input("x2", shape=(2,))
+    y = builder.add("y", x1, x2)
+    graph = builder.build(output_node=y)
 
-    with pytest.raises(ValueError, match="one Input node"):
-        generate_cpp(graph)
+    source = generate_cpp(graph)
+    assert sanitize_name("x1") in source
+    assert sanitize_name("x2") in source
 
 
-def test_generate_cpp_rejects_non_1d_shape():
-    # The Graph IR only restricts Linear/ReLU/Output shapes to match their
-    # input; an Input node's declared shape is not otherwise constrained, so
-    # this is a legal (if unusual) way to construct a 2D-shape node and
-    # exercise codegen's Tier-0 "1D only" validation.
+def test_generate_cpp_rejects_rank3_shape():
+    # 1D and 2D shapes are supported (Tier 2); rank-3 (and rank-0) shapes are
+    # still rejected. An Input node's declared shape is not otherwise
+    # constrained by the Graph IR, so this is a legal way to construct a
+    # rank-3 node and exercise codegen's rank validation.
     builder = GraphBuilder()
-    builder.input("x", shape=(2, 3))
+    builder.input("x", shape=(2, 3, 4))
     graph = builder.build(output_node="x")
 
-    with pytest.raises(ValueError, match="1D"):
+    with pytest.raises(ValueError, match="1D or 2D"):
         generate_cpp(graph)
+
+    # A 2D shape is now accepted.
+    builder2 = GraphBuilder()
+    builder2.input("x", shape=(2, 3))
+    graph2 = builder2.build(output_node="x")
+    assert "int main(" in generate_cpp(graph2)

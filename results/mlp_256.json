@@ -1,0 +1,34 @@
+{
+  "label": "mlp_256",
+  "timestamp": "2026-07-07T22:57:23.228115+00:00",
+  "graph": {
+    "num_nodes": 6,
+    "ops": {
+      "Input": 1,
+      "Linear": 3,
+      "ReLU": 2
+    },
+    "input_shapes": {
+      "x": [
+        256
+      ]
+    },
+    "output_shape": [
+      10
+    ]
+  },
+  "iters": 200,
+  "warmup": 20,
+  "openmp_used": false,
+  "correctness_verified": true,
+  "timing_s_per_iter": {
+    "interpreter": 7.136499999999658e-05,
+    "cpu_naive": 0.00040078833500000003,
+    "cpu_optimized": 5.028021e-05
+  },
+  "speedup": {
+    "naive_vs_interpreter": 0.17806156958135164,
+    "optimized_vs_naive": 7.971095088902771,
+    "optimized_vs_interpreter": 1.4193457028122312
+  }
+}

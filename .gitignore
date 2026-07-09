@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 build/
 examples/out/
+results/build/
 *.o
 *.out
 .pytest_cache/
