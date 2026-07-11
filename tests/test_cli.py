@@ -99,6 +99,34 @@ def test_compile_emit_dot_writes_graph_dot(mlp_model_path, tmp_path):
 
 
 @requires_gxx
+def test_compile_report_writes_graph_stats_and_artifacts(mlp_model_path, tmp_path):
+    out_dir = tmp_path / "out"
+    report_path = tmp_path / "report.md"
+    rc = cli.main(
+        [
+            "compile",
+            str(mlp_model_path),
+            "--out",
+            str(out_dir),
+            "--emit-dot",
+            "--report",
+            str(report_path),
+        ]
+    )
+    assert rc == 0
+    report = report_path.read_text()
+    assert "# TinyNN Compile Report" in report
+    assert "## Original Graph" in report
+    assert "## Optimized Graph" in report
+    assert "- backend: `cpp`" in report
+    assert "- quantization: disabled" in report
+    assert "- embedded/static memory: no" in report
+    assert str(out_dir / "tinynn_model.cpp") in report
+    assert str(out_dir / "tinynn_model") in report
+    assert str(out_dir / "graph.dot") in report
+
+
+@requires_gxx
 def test_compile_quantize_note_and_generated_source(mlp_model_path, tmp_path, capsys):
     out_dir = tmp_path / "out"
     rc = cli.main(

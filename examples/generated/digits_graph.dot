@@ -1,0 +1,7 @@
+digraph tinynn {
+  "x" [label="x\nInput\n(64,)", shape=ellipse];
+  "a0" [label="a0\nFusedLinearReLU\n(32,)", shape=box];
+  "logits" [label="logits\nLinear\n(10,)", shape=box, penwidth=2, style=bold];
+  "x" -> "a0";
+  "a0" -> "logits";
+}

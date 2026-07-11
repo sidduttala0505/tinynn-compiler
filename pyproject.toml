@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinynn-compiler"
+version = "0.1.0"
+description = "A tiny compiler for simple neural networks."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "onnx>=1.14",
+    "pytest>=7.0",
+]
+
+[project.optional-dependencies]
+examples = [
+    "scikit-learn>=1.3",
+]
+
+[project.scripts]
+tinynn = "tinynn.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tinynn*"]

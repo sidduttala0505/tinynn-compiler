@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
@@ -148,6 +149,119 @@ def _apply_quantize(graph: Graph) -> Graph:
     return graph
 
 
+def _graph_stats(graph: Graph) -> Dict[str, object]:
+    """Return small Markdown-friendly graph statistics for reports."""
+    input_nodes = graph.input_nodes()
+    output = graph.get_node(graph.output_node)
+    parameter_count = 0
+    for node in graph.nodes:
+        if node.weight is not None:
+            parameter_count += int(node.weight.size)
+        if node.bias is not None:
+            parameter_count += int(node.bias.size)
+
+    return {
+        "nodes": len(graph.nodes),
+        "ops": dict(Counter(node.op for node in graph.nodes)),
+        "inputs": {node.name: list(node.shape) for node in input_nodes},
+        "output_node": graph.output_node,
+        "output_shape": list(output.shape),
+        "parameters": parameter_count,
+    }
+
+
+def _format_ops(ops: Dict[str, int]) -> str:
+    if not ops:
+        return "(none)"
+    return ", ".join(f"{op}: {count}" for op, count in sorted(ops.items()))
+
+
+def _report_graph_section(title: str, stats: Dict[str, object]) -> list[str]:
+    inputs = stats["inputs"]
+    input_text = ", ".join(f"{name}{tuple(shape)}" for name, shape in inputs.items())
+    if not input_text:
+        input_text = "(none)"
+    return [
+        f"## {title}",
+        "",
+        f"- nodes: {stats['nodes']}",
+        f"- ops: {_format_ops(stats['ops'])}",
+        f"- inputs: {input_text}",
+        f"- output: {stats['output_node']}{tuple(stats['output_shape'])}",
+        f"- parameters: {stats['parameters']}",
+        "",
+    ]
+
+
+def _write_compile_report(
+    path: Path,
+    *,
+    model_path: Path,
+    original_graph: Graph,
+    compiled_graph: Graph,
+    backend: str,
+    quantized: bool,
+    static_memory: bool,
+    artifacts: Sequence[Path],
+    benchmark: Optional[Dict[str, object]],
+) -> Path:
+    """Write a concise Markdown compile report and return its path."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        "# TinyNN Compile Report",
+        "",
+        f"- model: `{model_path}`",
+        f"- backend: `{backend}`",
+        f"- quantization: {'enabled' if quantized else 'disabled'}",
+        f"- embedded/static memory: {'yes' if static_memory else 'no'}",
+        "",
+    ]
+    lines.extend(_report_graph_section("Original Graph", _graph_stats(original_graph)))
+    lines.extend(
+        _report_graph_section(
+            "Optimized Graph",
+            _graph_stats(compiled_graph),
+        )
+    )
+
+    if benchmark is not None:
+        timing = benchmark["timing_s_per_iter"]
+        speedup = benchmark["speedup"]
+        lines.extend(
+            [
+                "## Benchmark",
+                "",
+                f"- iters: {benchmark['iters']}",
+                f"- warmup: {benchmark['warmup']}",
+                f"- OpenMP used: {benchmark['openmp_used']}",
+                f"- correctness verified: {benchmark['correctness_verified']}",
+                "",
+                "| variant | seconds/iter |",
+                "|---|---:|",
+                f"| interpreter | {timing['interpreter']:.6e} |",
+                f"| cpu naive | {timing['cpu_naive']:.6e} |",
+                f"| cpu optimized | {timing['cpu_optimized']:.6e} |",
+                "",
+                "| speedup | value |",
+                "|---|---:|",
+                f"| naive vs interpreter | {speedup['naive_vs_interpreter']:.2f}x |",
+                f"| optimized vs naive | {speedup['optimized_vs_naive']:.2f}x |",
+                f"| optimized vs interpreter | {speedup['optimized_vs_interpreter']:.2f}x |",
+                "",
+            ]
+        )
+
+    lines.extend(["## Output Artifacts", ""])
+    for artifact in artifacts:
+        lines.append(f"- `{artifact}`")
+    lines.append("")
+
+    path.write_text("\n".join(lines))
+    return path
+
+
 # --------------------------------------------------------------------------- #
 # Subcommand: compile
 # --------------------------------------------------------------------------- #
@@ -162,6 +276,7 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         graph = _apply_quantize(graph)
 
     out_dir = Path(args.out)
+    artifacts = []
 
     if args.backend == "embedded_c":
         try:
@@ -177,19 +292,22 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         if args.fast:
             options = CodegenOptions.fast(openmp=openmp_available())
         model = compile_graph(graph, out_dir, options=options)
+    artifacts.extend([model.cpp_path, model.binary_path])
 
     if args.emit_dot:
         dot_path = save_dot(graph, out_dir / "graph.dot")
+        artifacts.append(dot_path)
         print(f"Wrote DOT graph to {dot_path}")
 
     lang = "C" if args.backend == "embedded_c" else "C++"
     print(f"Wrote generated {lang} source to {model.cpp_path}")
     print(f"Wrote compiled binary to {model.binary_path}")
 
+    benchmark_result = None
     if args.benchmark:
         label = Path(args.model).stem
         inputs = _random_inputs(original_graph, args.seed)
-        result = benchmark_graph(
+        benchmark_result = benchmark_graph(
             original_graph,
             inputs,
             iters=args.iters,
@@ -197,7 +315,22 @@ def _cmd_compile(args: argparse.Namespace) -> int:
             results_dir=out_dir,
             label=label,
         )
-        _print_benchmark_summary(result)
+        artifacts.extend([out_dir / f"{label}.json", out_dir / f"{label}.md"])
+        _print_benchmark_summary(benchmark_result)
+
+    if args.report is not None:
+        report_path = _write_compile_report(
+            Path(args.report),
+            model_path=Path(args.model),
+            original_graph=original_graph,
+            compiled_graph=graph,
+            backend=args.backend,
+            quantized=args.quantize,
+            static_memory=args.backend == "embedded_c",
+            artifacts=artifacts,
+            benchmark=benchmark_result,
+        )
+        print(f"Wrote compile report to {report_path}")
 
     return 0
 
@@ -347,6 +480,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_compile.add_argument(
         "--emit-dot", action="store_true",
         help="Also write the (post-pass) graph as out/graph.dot",
+    )
+    p_compile.add_argument(
+        "--report",
+        default=None,
+        help="Write a Markdown compile report to the given path",
     )
     p_compile.add_argument(
         "--seed", type=int, default=0,

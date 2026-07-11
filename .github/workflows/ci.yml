@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install package
+        run: python -m pip install -e .
+
+      - name: Run tests
+        run: python -m pytest
+
+      - name: Check console help
+        run: tinynn --help
+
+      - name: Check module help
+        run: python -m tinynn --help
+
+      - name: Compile demo with benchmark and DOT
+        run: >
+          python -m tinynn compile examples/models/digits_mlp.onnx
+          --out /tmp/tinynn_demo
+          --benchmark
+          --emit-dot
+
+      - name: Compile quantized embedded C demo
+        run: >
+          python -m tinynn compile examples/models/digits_mlp.onnx
+          --out /tmp/tinynn_emb
+          --backend embedded_c
+          --quantize
