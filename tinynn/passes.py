@@ -29,6 +29,10 @@ This module provides:
       equivalent ``QuantizedLinear`` node (int8 quantized inference; see
       :mod:`tinynn.ops`). Opt-in: numerically different from float Linear,
       so it is NOT part of :func:`default_pipeline`.
+    * :func:`quantize_fused_linear_relu` -- replace every ``FusedLinearReLU``
+      node with an equivalent ``QuantizedFusedLinearReLU`` node. Opt-in for
+      the same reason; run after :func:`fuse_linear_relu` to lower
+      ``Linear -> ReLU`` chains to quantized fused form.
     * :class:`PassManager` -- runs a sequence of passes in order.
     * :func:`default_pipeline` -- a ``PassManager`` with a sensible default
       pass order (constant folding, algebraic simplification, dead code
@@ -49,6 +53,7 @@ from .ops import (
     LINEAR,
     MATMUL,
     MUL,
+    QUANTIZED_FUSED_LINEAR_RELU,
     QUANTIZED_LINEAR,
     RELU,
     SIGMOID,
@@ -63,6 +68,7 @@ __all__ = [
     "dead_code_elimination",
     "fuse_linear_relu",
     "quantize_linear",
+    "quantize_fused_linear_relu",
     "PassManager",
     "default_pipeline",
 ]
@@ -208,7 +214,11 @@ def _simplify_algebraic_once(graph: Graph) -> Tuple[Graph, bool]:
         elif node.op == RELU:
             src_name = resolve(node.inputs[0])
             src = node_by_name.get(src_name)
-            if src is not None and src.op in (RELU, FUSED_LINEAR_RELU):
+            if src is not None and src.op in (
+                RELU,
+                FUSED_LINEAR_RELU,
+                QUANTIZED_FUSED_LINEAR_RELU,
+            ):
                 alias = src_name
 
         if alias is not None:
@@ -249,9 +259,10 @@ def simplify_algebraic(graph: Graph) -> Graph:
           operand order; ``Sub(c, x)`` is negation, not an identity).
         * ``Mul(x, c)`` or ``Mul(c, x)`` where ``c`` is a ``Const`` of all
           ones -> alias to ``x``.
-        * ``ReLU`` whose single input is itself a ``ReLU`` or
-          ``FusedLinearReLU`` node -> alias to that input (``relu`` is
-          idempotent).
+        * ``ReLU`` whose single input is itself a ``ReLU``,
+          ``FusedLinearReLU``, or ``QuantizedFusedLinearReLU`` node -> alias
+          to that input (``relu`` is idempotent and those fused outputs are
+          already clamped at 0).
 
     Runs the scan+rebuild in :func:`_simplify_algebraic_once` to a fixpoint
     (stopping as soon as a scan makes no changes, with a hard cap of 10
@@ -378,11 +389,11 @@ def quantize_linear(graph: Graph) -> Graph:
     replacement is purely a change of *op* (float matmul -> int8 quantized
     matmul); see :mod:`tinynn.ops` for the exact quantized semantics.
 
-    ``FusedLinearReLU`` nodes are deliberately left untouched: fusing and
-    quantizing are only composable, today, in the sense that running this
-    pass after :func:`fuse_linear_relu` is a no-op for already-fused nodes
-    (it quantizes only the remaining, unfused ``Linear`` nodes). A quantized
-    fused ``Linear+ReLU`` op is future work.
+    ``FusedLinearReLU`` nodes are deliberately left untouched -- use
+    :func:`quantize_fused_linear_relu` to quantize those. Running both
+    passes (in either order) after :func:`fuse_linear_relu` lowers every
+    fused pair to ``QuantizedFusedLinearReLU`` and every remaining bare
+    ``Linear`` to ``QuantizedLinear``.
 
     Not part of :func:`default_pipeline`: quantization changes numerics
     (int8 rounding + rescale), so callers must opt in explicitly.
@@ -394,6 +405,40 @@ def quantize_linear(graph: Graph) -> Graph:
                 Node(
                     name=node.name,
                     op=QUANTIZED_LINEAR,
+                    inputs=node.inputs,
+                    shape=node.shape,
+                    weight=node.weight,
+                    bias=node.bias,
+                )
+            )
+        else:
+            new_nodes.append(node)
+
+    return Graph(nodes=tuple(new_nodes), output_node=graph.output_node)
+
+
+def quantize_fused_linear_relu(graph: Graph) -> Graph:
+    """Replace every ``FusedLinearReLU`` node with ``QuantizedFusedLinearReLU``.
+
+    Each ``FusedLinearReLU`` node is swapped 1:1 for a
+    ``QuantizedFusedLinearReLU`` node with the identical name, inputs, shape,
+    weight and bias -- purely a change of *op* (float fused matmul+ReLU ->
+    int8 quantized matmul, rescale + bias, then the ReLU clamp last; see
+    :mod:`tinynn.ops` for the exact semantics). Bare ``Linear`` nodes are
+    left untouched -- use :func:`quantize_linear` for those. To lower a
+    ``Linear -> ReLU`` chain to quantized fused form, run
+    :func:`fuse_linear_relu` first, then this pass.
+
+    Not part of :func:`default_pipeline`: quantization changes numerics
+    (int8 rounding + rescale), so callers must opt in explicitly.
+    """
+    new_nodes: List[Node] = []
+    for node in graph.nodes:
+        if node.op == FUSED_LINEAR_RELU:
+            new_nodes.append(
+                Node(
+                    name=node.name,
+                    op=QUANTIZED_FUSED_LINEAR_RELU,
                     inputs=node.inputs,
                     shape=node.shape,
                     weight=node.weight,

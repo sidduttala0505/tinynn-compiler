@@ -1,0 +1,44 @@
+{
+  "timestamp": "2026-07-07T23:29:10.852070+00:00",
+  "dataset": {
+    "name": "sklearn digits (8x8)",
+    "train_samples": 1348,
+    "test_samples": 449,
+    "features": 64,
+    "classes": 10
+  },
+  "model_architecture": "64 -> 32 (ReLU) -> 10, trained in pure NumPy (no PyTorch)",
+  "seed": 0,
+  "epochs": 30,
+  "bench_iters": 2000,
+  "openmp_used": false,
+  "accuracy": {
+    "NumPy baseline (train)": 0.9770029673590505,
+    "NumPy baseline (test)": 0.9732739420935412,
+    "TinyNN interpreter (test)": 0.9732739420935412,
+    "TinyNN interpreter, optimized graph (test)": 0.9732739420935412,
+    "TinyNN compiled C++ optimized (test)": 0.9732739420935412,
+    "int8 interpreter (test)": 0.9755011135857461,
+    "int8 compiled C++ (test)": 0.9755011135857461
+  },
+  "latency_s_per_iter": {
+    "interpreter": 2.9154149524401875e-06,
+    "cpu_naive": 7.135415e-07,
+    "cpu_optimized_float": 4.181875e-07,
+    "cpu_int8_quantized": 5.72833e-07
+  },
+  "speedup_vs_naive": {
+    "cpu_optimized_float": 1.7062717082648333,
+    "cpu_int8_quantized": 1.2456361627210724
+  },
+  "float_fused_vs_quantized_fused_speedup": 0.7300338842210556,
+  "max_logit_diff_interpreter_vs_numpy": 3.93971630430201e-07,
+  "verification": {
+    "rtol": 1e-09,
+    "atol": 1e-09,
+    "samples_checked": 50,
+    "all_compiled_variants_verified_before_timing": true
+  },
+  "total_wall_time_s": 3.8566311670001596,
+  "reproduction_command": "./venv/bin/python examples/mnist_mlp_demo.py --out results/mnist --seed 0 --epochs 30 --iters 2000"
+}

@@ -23,8 +23,18 @@ import pytest
 from tinynn.codegen import CodegenOptions, compile_graph
 from tinynn.graph import GraphBuilder
 from tinynn.interpreter import _quantize_symmetric, run as interp_run
-from tinynn.ops import FUSED_LINEAR_RELU, LINEAR, QUANTIZED_LINEAR
-from tinynn.passes import default_pipeline, quantize_linear
+from tinynn.ops import (
+    FUSED_LINEAR_RELU,
+    LINEAR,
+    QUANTIZED_FUSED_LINEAR_RELU,
+    QUANTIZED_LINEAR,
+)
+from tinynn.passes import (
+    default_pipeline,
+    fuse_linear_relu,
+    quantize_fused_linear_relu,
+    quantize_linear,
+)
 
 _needs_gxx = pytest.mark.skipif(
     shutil.which("g++") is None, reason="g++ not found on PATH"
@@ -282,3 +292,170 @@ def test_quantized_chain_with_reuse_buffers_matches_interpreter(tmp_path):
     source = model.cpp_path.read_text()
     assert "_xq" in source
     assert "tinynn_buf_" in source
+
+
+# --------------------------------------------------------------------------- #
+# QuantizedFusedLinearReLU: pass, semantics, and end-to-end exactness
+# --------------------------------------------------------------------------- #
+def _linear_relu_chain_graph(seed=3):
+    """Input -> Linear -> ReLU -> Linear -> ReLU -> Linear (final, unfused)."""
+    rng = np.random.default_rng(seed)
+    b = GraphBuilder()
+    x = b.input("x", shape=(12,))
+    h = b.linear("l0", x, rng.standard_normal((12, 10)), rng.standard_normal(10))
+    h = b.relu("r0", h)
+    h = b.linear("l1", h, rng.standard_normal((10, 8)), rng.standard_normal(8))
+    h = b.relu("r1", h)
+    h = b.linear("l2", h, rng.standard_normal((8, 4)), rng.standard_normal(4))
+    return b.build(output_node=h)
+
+
+def test_quantize_fused_linear_relu_pass_replaces_fused_nodes():
+    graph = fuse_linear_relu(_linear_relu_chain_graph())
+    fused_names = {n.name for n in graph.nodes if n.op == FUSED_LINEAR_RELU}
+    assert fused_names  # sanity: fusion actually happened
+
+    quantized = quantize_fused_linear_relu(graph)
+    q_by_name = quantized.node_map()
+
+    assert quantized.output_node == graph.output_node
+    for node in graph.nodes:
+        q_node = q_by_name[node.name]
+        assert q_node.inputs == node.inputs
+        assert q_node.shape == node.shape
+        if node.op == FUSED_LINEAR_RELU:
+            assert q_node.op == QUANTIZED_FUSED_LINEAR_RELU
+            np.testing.assert_array_equal(q_node.weight, node.weight)
+            np.testing.assert_array_equal(q_node.bias, node.bias)
+        else:
+            # Everything else (Input, the final unfused Linear) is untouched.
+            assert q_node.op == node.op
+
+
+def test_fuse_then_quantize_lowers_linear_relu_to_quantized_fused():
+    # The full opt-in int8 lowering: fuse Linear+ReLU pairs, quantize the
+    # fused pairs, quantize the remaining bare Linears. No float Linear,
+    # ReLU, or FusedLinearReLU survives.
+    graph = _linear_relu_chain_graph()
+    lowered = quantize_linear(quantize_fused_linear_relu(fuse_linear_relu(graph)))
+    ops = [n.op for n in lowered.nodes]
+
+    assert ops.count(QUANTIZED_FUSED_LINEAR_RELU) == 2
+    assert ops.count(QUANTIZED_LINEAR) == 1
+    assert LINEAR not in ops and FUSED_LINEAR_RELU not in ops
+    assert "ReLU" not in ops
+
+    x = np.random.default_rng(4).standard_normal(12)
+    out = interp_run(lowered, {"x": x})
+    assert out.shape == (4,)
+    assert np.all(np.isfinite(out))
+
+
+def test_quantized_fused_equals_relu_of_quantized_linear():
+    # Pins down the documented op order: the ReLU clamp is applied LAST,
+    # after the rescale + bias add -- so QuantizedFusedLinearReLU must equal
+    # max(0, QuantizedLinear) EXACTLY (same weights, same input), including
+    # cases where the pre-activation is negative.
+    rng = np.random.default_rng(5)
+    weight = rng.standard_normal((14, 9)) * 2.0
+    bias = rng.standard_normal(9) - 1.0  # push some pre-activations negative
+    x = rng.standard_normal(14)
+
+    bq = GraphBuilder()
+    xq = bq.input("x", shape=(14,))
+    yq = bq.quantized_linear("qlin", xq, weight, bias)
+    q = interp_run(bq.build(output_node=yq), {"x": x})
+
+    bf = GraphBuilder()
+    xf = bf.input("x", shape=(14,))
+    yf = bf.quantized_fused_linear_relu("qflr", xf, weight, bias)
+    f = interp_run(bf.build(output_node=yf), {"x": x})
+
+    np.testing.assert_array_equal(f, np.maximum(q, 0.0))
+    assert np.any(np.maximum(q, 0.0) == 0.0)  # sanity: the clamp actually bit
+
+
+def test_quantized_fused_accuracy_close_to_float_fused():
+    rng = np.random.default_rng(43)
+    weight = rng.standard_normal((16, 8))
+    bias = rng.standard_normal(8)
+    x = rng.standard_normal(16)
+
+    bf = GraphBuilder()
+    xf = bf.input("x", shape=(16,))
+    yf = bf.fused_linear_relu("flr", xf, weight, bias)
+    f = interp_run(bf.build(output_node=yf), {"x": x})
+
+    bq = GraphBuilder()
+    xq = bq.input("x", shape=(16,))
+    yq = bq.quantized_fused_linear_relu("qflr", xq, weight, bias)
+    q = interp_run(bq.build(output_node=yq), {"x": x})
+
+    rel_err = np.max(np.abs(q - f)) / (np.max(np.abs(f)) + 1e-12)
+    assert rel_err < 0.02
+
+
+@_needs_gxx
+def test_quantized_fused_cpp_matches_interpreter(tmp_path):
+    rng = np.random.default_rng(12)
+    weight = rng.standard_normal((10, 6)) * 3.0
+    bias = rng.standard_normal(6) - 0.5
+    x = rng.standard_normal(10) * 2.0
+
+    b = GraphBuilder()
+    xn = b.input("x", shape=(10,))
+    y = b.quantized_fused_linear_relu("qflr", xn, weight, bias)
+    graph = b.build(output_node=y)
+
+    model = compile_graph(graph, tmp_path / "case_fused_single")
+    actual = model.run(x)
+    expected = interp_run(graph, {"x": x})
+    assert np.any(expected == 0.0)  # sanity: the clamp actually bit
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+
+@_needs_gxx
+def test_lowered_linear_relu_chain_cpp_matches_interpreter(tmp_path):
+    # Targeted end-to-end test for the Linear->ReLU quantized fused path:
+    # several random graphs, each lowered via fuse -> quantize_fused ->
+    # quantize_linear, compiled, and checked against both the quantized
+    # interpreter (tight tolerance) and the float interpreter (loose bound).
+    for seed in range(5):
+        graph = _linear_relu_chain_graph(seed=seed)
+        lowered = quantize_linear(
+            quantize_fused_linear_relu(fuse_linear_relu(graph))
+        )
+        assert QUANTIZED_FUSED_LINEAR_RELU in {n.op for n in lowered.nodes}
+
+        x = np.random.default_rng(100 + seed).standard_normal(12)
+        expected = interp_run(lowered, {"x": x})
+        model = compile_graph(lowered, tmp_path / f"case_lowered_{seed}")
+        actual = model.run(x)
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+        f = interp_run(graph, {"x": x})
+        rel_err = np.max(np.abs(expected - f)) / (np.max(np.abs(f)) + 1e-12)
+        assert rel_err < 0.25  # multi-layer int8 error compounds; loose bound
+
+
+@_needs_gxx
+def test_quantized_fused_chain_with_reuse_buffers_matches_interpreter(tmp_path):
+    rng = np.random.default_rng(13)
+    w0 = rng.standard_normal((8, 8))
+    b0 = rng.standard_normal(8)
+    w1 = rng.standard_normal((8, 8))
+    b1 = rng.standard_normal(8)
+    x = rng.standard_normal(8)
+
+    b = GraphBuilder()
+    xn = b.input("x", shape=(8,))
+    h = b.quantized_fused_linear_relu("qflr0", xn, w0, b0)
+    y = b.quantized_fused_linear_relu("qflr1", h, w1, b1)
+    graph = b.build(output_node=y)
+
+    model = compile_graph(
+        graph, tmp_path / "case_fused_reuse", options=CodegenOptions(reuse_buffers=True)
+    )
+    actual = model.run(x)
+    expected = interp_run(graph, {"x": x})
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)

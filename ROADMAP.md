@@ -70,7 +70,11 @@
       activation quantization, int64 accumulation, float rescale; identical
       rounding semantics in interpreter and C++ so the quantized paths
       compare exactly. Opt-in (not in the default pipeline)
-- [ ] Quantized FusedLinearReLU, batched/2D ONNX activations (future work)
+- [x] `QuantizedFusedLinearReLU` op + `quantize_fused_linear_relu` pass:
+      same int8 scheme as `QuantizedLinear`, ReLU clamp applied LAST (after
+      rescale + bias); `fuse_linear_relu` -> `quantize_fused_linear_relu` ->
+      `quantize_linear` lowers a Linear/ReLU MLP fully to int8. Opt-in
+- [ ] Batched/2D ONNX activations (future work)
 
 ## Tier 7 — Rigor ✅ (complete for current ops; extend alongside new ops)
 
@@ -81,13 +85,28 @@
       `tests/test_fuzz_graphs.py`
 - [x] Stronger correctness suite across all ops and passes
 
-## Tier 8 — Demo / story (partial)
+## Tier 8 — Demo / story ✅ (complete)
 
 - [x] End-to-end example (`examples/`): build → interpret → optimize →
       compile → verify — `examples/mlp_demo.py`
 - [x] Benchmark harness with results written to `results/`
       (`python -m tinynn.benchmark`)
-- [ ] MNIST MLP demo if feasible
+- [x] MNIST-style MLP demo — `examples/mnist_mlp_demo.py`: pure-NumPy
+      training on sklearn digits (8x8; honestly labeled, NOT real MNIST),
+      ONNX export via `onnx.helper` (no torch), TinyNN import → interpret →
+      optimize → compile (naive/optimized/int8) → verify against the
+      interpreter oracle → benchmark → `results/mnist/report.md`
+- [x] Real CLI (`python -m tinynn` / `python -m tinynn.cli`, argparse only):
+      `compile` (pipelines, opt-in `--quantize`, `--fast`, `--benchmark`,
+      `--emit-dot`, `--backend cpp|embedded_c`), `run`, `benchmark`,
+      `visualize`; `.onnx` and `.json` models; clean errors when `onnx`
+      is missing — `tinynn/cli.py`, `tests/test_cli.py`
+- [x] Experimental static-memory embedded C backend (`tinynn/embedded.py`,
+      `compile_embedded` / `generate_embedded_c`): plain C99, file-scope
+      `static` arrays only (no malloc/new/std::vector — enforced by a
+      source-inspection test), int8 weights as `static const int8_t`;
+      Linear/ReLU/FusedLinearReLU/QuantizedLinear/QuantizedFusedLinearReLU
+      only; verified against the interpreter and the C++ backend
 
 ## Standing rules
 

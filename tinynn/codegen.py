@@ -53,6 +53,7 @@ from .graph import (
     MATMUL,
     MUL,
     OUTPUT,
+    QUANTIZED_FUSED_LINEAR_RELU,
     QUANTIZED_LINEAR,
     RELU,
     SIGMOID,
@@ -138,6 +139,7 @@ _SUPPORTED = {
     SIGMOID,
     CONST,
     QUANTIZED_LINEAR,
+    QUANTIZED_FUSED_LINEAR_RELU,
 }
 
 
@@ -515,14 +517,14 @@ def generate_cpp(graph: Graph, options: Optional[CodegenOptions] = None) -> str:
             lines.append("};")
             lines.append("")
             continue
-        if node.op == QUANTIZED_LINEAR:
+        if node.op in (QUANTIZED_LINEAR, QUANTIZED_FUSED_LINEAR_RELU):
             ident = ids[node.name]
             in_features, out_features = node.weight.shape
             w_q, s_w = _quantize_weight_for_codegen(node.weight)
             wq_body = _format_int_array(w_q)
             b_body = _format_double_array(node.bias)
             lines.append(
-                f"// QuantizedLinear node {node.name!r}: in_features={in_features}, "
+                f"// {node.op} node {node.name!r}: in_features={in_features}, "
                 f"out_features={out_features}, s_w={format(s_w, '.17g')}"
             )
             lines.append(f"// Weight quantized at codegen time (deterministic, round-half-away-from-zero).")
@@ -607,10 +609,10 @@ def generate_cpp(graph: Graph, options: Optional[CodegenOptions] = None) -> str:
             )
             compute_lines.append("")
 
-        elif node.op == QUANTIZED_LINEAR:
+        elif node.op in (QUANTIZED_LINEAR, QUANTIZED_FUSED_LINEAR_RELU):
             src_ident = ids[node.inputs[0]]
             in_features, out_features = node.weight.shape
-            decl_lines.append(f"    // QuantizedLinear node {node.name!r}")
+            decl_lines.append(f"    // {node.op} node {node.name!r}")
             decl_lines.append(f"    std::vector<double> {ident}({out_features});")
             scratch_decl = (
                 f"    std::vector<long long> {ident}_xq({in_features});"
@@ -620,9 +622,12 @@ def generate_cpp(graph: Graph, options: Optional[CodegenOptions] = None) -> str:
             decl_lines.append("")
             quantized_scratch_decl_lines.append(scratch_decl)
 
-            compute_lines.append(f"    // QuantizedLinear node {node.name!r}")
+            compute_lines.append(f"    // {node.op} node {node.name!r}")
             compute_lines.extend(
-                _emit_quantized_linear(ident, src_ident, in_features, out_features)
+                _emit_quantized_linear(
+                    ident, src_ident, in_features, out_features,
+                    relu=node.op == QUANTIZED_FUSED_LINEAR_RELU,
+                )
             )
             compute_lines.append("")
 
@@ -885,8 +890,10 @@ def _emit_quantized_linear(
     src_ident: str,
     in_features: int,
     out_features: int,
+    relu: bool = False,
 ) -> List[str]:
-    """Return compute-only statements for a ``QuantizedLinear`` node.
+    """Return compute-only statements for a ``QuantizedLinear`` node (or, with
+    ``relu=True``, a ``QuantizedFusedLinearReLU`` node).
 
     Always plain loops -- ``CodegenOptions.tile_size``/``openmp`` apply only
     to the float Linear/FusedLinearReLU/MatMul paths, never to quantized
@@ -898,6 +905,8 @@ def _emit_quantized_linear(
     (``sx * sw``) plus the float bias add. Rounding is round-half-away-from-
     zero via ``std::lround`` (matches the interpreter's
     ``sign(v) * floor(abs(v) + 0.5)``, NOT NumPy's round-half-to-even).
+    With ``relu=True`` the ReLU clamp is applied LAST, after the rescale and
+    bias add -- identical to the interpreter's QuantizedFusedLinearReLU.
     """
     lines: List[str] = []
     lines.append("{")
@@ -925,9 +934,15 @@ def _emit_quantized_linear(
     lines.append(f"        for (int i = 0; i < {in_features}; ++i) {{")
     lines.append(f"            acc += {ident}_xq[i] * {ident}_wq[i * {out_features} + j];")
     lines.append("        }")
-    lines.append(
-        f"        {ident}[j] = static_cast<double>(acc) * (sx * {ident}_sw) + {ident}_b[j];"
-    )
+    if relu:
+        lines.append(
+            f"        {ident}[j] = std::max(0.0, "
+            f"static_cast<double>(acc) * (sx * {ident}_sw) + {ident}_b[j]);"
+        )
+    else:
+        lines.append(
+            f"        {ident}[j] = static_cast<double>(acc) * (sx * {ident}_sw) + {ident}_b[j];"
+        )
     lines.append("    }")
     lines.append("}")
     return lines

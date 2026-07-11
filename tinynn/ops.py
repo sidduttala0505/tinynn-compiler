@@ -48,6 +48,20 @@ CONST = "Const"
 # zero (matching C++ std::lround), NOT NumPy's default round-half-even.
 QUANTIZED_LINEAR = "QuantizedLinear"
 
+# A FusedLinearReLU executed with the exact same int8 quantization scheme as
+# QuantizedLinear (same scale formula, same round-half-away-from-zero
+# rounding, same 64-bit integer accumulation). The ReLU clamp is applied LAST,
+# after the float rescale and bias add:
+#
+#   y = max(0.0, (sum_i x_q[i] * w_q[i][j]) * (s_x * s_w) + bias[j])
+#
+# so the only difference from QuantizedLinear is the final max with zero --
+# the quantized pre-activation is identical. Produced by the
+# quantize_fused_linear_relu pass in tinynn.passes (Linear + ReLU can thus be
+# lowered as fuse_linear_relu -> quantize_fused_linear_relu), but can also be
+# constructed directly like any other op.
+QUANTIZED_FUSED_LINEAR_RELU = "QuantizedFusedLinearReLU"
+
 # The set of ops the IR currently understands.
 # NOTE: "FusedLinearReLU" fuses a Linear immediately followed by a ReLU into a
 # single node (same weight/bias as the Linear, output already clamped at 0).
@@ -68,4 +82,5 @@ SUPPORTED_OPS = {
     SIGMOID,
     CONST,
     QUANTIZED_LINEAR,
+    QUANTIZED_FUSED_LINEAR_RELU,
 }

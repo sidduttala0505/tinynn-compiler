@@ -44,6 +44,7 @@ from .ops import (
     MATMUL,
     MUL,
     OUTPUT,
+    QUANTIZED_FUSED_LINEAR_RELU,
     QUANTIZED_LINEAR,
     RELU,
     SIGMOID,
@@ -69,6 +70,7 @@ __all__ = [
     "SIGMOID",
     "CONST",
     "QUANTIZED_LINEAR",
+    "QUANTIZED_FUSED_LINEAR_RELU",
     "SUPPORTED_OPS",
     "Node",
     "Graph",
@@ -152,7 +154,12 @@ class Node:
         elif self.op == OUTPUT:
             self._require_single_input()
             self._require_no_weights()
-        elif self.op in (LINEAR, FUSED_LINEAR_RELU, QUANTIZED_LINEAR):
+        elif self.op in (
+            LINEAR,
+            FUSED_LINEAR_RELU,
+            QUANTIZED_LINEAR,
+            QUANTIZED_FUSED_LINEAR_RELU,
+        ):
             self._validate_linear()
         elif self.op in (ADD, SUB, MUL, MATMUL):
             self._require_two_inputs()
@@ -311,7 +318,12 @@ class Graph:
 
         # Shape compatibility between connected nodes.
         for node in self.nodes:
-            if node.op in (LINEAR, FUSED_LINEAR_RELU, QUANTIZED_LINEAR):
+            if node.op in (
+                LINEAR,
+                FUSED_LINEAR_RELU,
+                QUANTIZED_LINEAR,
+                QUANTIZED_FUSED_LINEAR_RELU,
+            ):
                 src = node_by_name[node.inputs[0]]
                 in_features = int(node.weight.shape[0])
                 if src.shape != (in_features,):
@@ -497,6 +509,29 @@ class GraphBuilder:
             Node(
                 name=name,
                 op=QUANTIZED_LINEAR,
+                inputs=(input_name,),
+                shape=out_features,
+                weight=weight,
+                bias=bias,
+            )
+        )
+        return name
+
+    def quantized_fused_linear_relu(
+        self, name: str, input_name: str, weight: np.ndarray, bias: np.ndarray
+    ) -> str:
+        """Add a ``QuantizedFusedLinearReLU`` node (see :mod:`tinynn.ops`).
+
+        Stores the ORIGINAL float64 weight/bias, identically to ``linear``;
+        quantization happens deterministically at eval/codegen time, and the
+        ReLU clamp is applied after the final rescale + bias add.
+        """
+        weight = np.asarray(weight, dtype=DTYPE)
+        out_features = (int(weight.shape[1]),) if weight.ndim == 2 else ()
+        self._nodes.append(
+            Node(
+                name=name,
+                op=QUANTIZED_FUSED_LINEAR_RELU,
                 inputs=(input_name,),
                 shape=out_features,
                 weight=weight,

@@ -22,6 +22,7 @@ from .ops import (
     MATMUL,
     MUL,
     OUTPUT,
+    QUANTIZED_FUSED_LINEAR_RELU,
     QUANTIZED_LINEAR,
     RELU,
     SIGMOID,
@@ -102,6 +103,14 @@ def run(graph: Graph, inputs: Inputs) -> np.ndarray:
         elif node.op == QUANTIZED_LINEAR:
             x = _single_input_value(node, values)
             values[node.name] = _eval_quantized_linear(x, node.weight, node.bias)
+        elif node.op == QUANTIZED_FUSED_LINEAR_RELU:
+            # Same quantized matmul as QuantizedLinear; the ReLU clamp is
+            # applied LAST, after the float rescale + bias add (see
+            # tinynn.ops).
+            x = _single_input_value(node, values)
+            values[node.name] = np.maximum(
+                _eval_quantized_linear(x, node.weight, node.bias), 0.0
+            )
         elif node.op == OUTPUT:
             values[node.name] = _single_input_value(node, values)
         elif node.op == ADD:
