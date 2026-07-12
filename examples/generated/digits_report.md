@@ -42,8 +42,7 @@
 
 ## Output Artifacts
 
-- `/tmp/tinynn_artifacts_float/tinynn_model.cpp`
-- `/tmp/tinynn_artifacts_float/tinynn_model`
-- `/tmp/tinynn_artifacts_float/graph.dot`
-- `/tmp/tinynn_artifacts_float/digits_mlp.json`
-- `/tmp/tinynn_artifacts_float/digits_mlp.md`
+- `examples/generated/digits_float.cpp`
+- `examples/generated/digits_graph.dot`
+- `examples/generated/digits_int8_embedded.c`
+- `examples/generated/digits_report.md`
