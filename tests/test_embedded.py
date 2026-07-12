@@ -131,6 +131,8 @@ def test_generate_embedded_c_source_has_no_dynamic_allocation_or_cpp():
 
     source = generate_embedded_c(graph)
 
+    assert "#define _POSIX_C_SOURCE 199309L" in source
+    assert source.index("#define _POSIX_C_SOURCE 199309L") < source.index("#include <time.h>")
     assert "std::vector" not in source
     assert "malloc" not in source
     assert "new " not in source

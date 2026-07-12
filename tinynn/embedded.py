@@ -143,6 +143,7 @@ def generate_embedded_c(graph: Graph) -> str:
         )
     lines.append(f"// output_node: {graph.output_node}")
     lines.append("")
+    lines.append("#define _POSIX_C_SOURCE 199309L")
     lines.append("#include <stdio.h>")
     lines.append("#include <math.h>")
     lines.append("#include <stdint.h>")

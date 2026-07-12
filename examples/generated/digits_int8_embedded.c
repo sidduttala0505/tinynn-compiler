@@ -7,6 +7,7 @@
 //   logits: QuantizedLinear inputs=['a0'] shape=(10,)
 // output_node: logits
 
+#define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
 #include <math.h>
 #include <stdint.h>
