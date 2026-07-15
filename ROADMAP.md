@@ -52,13 +52,13 @@
       liveness-based exact-size slot planner; e.g. 5 logical buffers -> 2
       physical slots on an MLP chain)
 
-## Tier 5 — GPU (blocked on environment)
+## Tier 5 — GPU (minimal vertical slice)
 
-- [ ] CUDA backend — BLOCKED: the development machine (arm64 macOS) has no
-      nvcc/CUDA toolchain, so a GPU backend cannot be compiled or verified
-      against the interpreter oracle here. `tests/test_cuda.py` skips cleanly
-      without nvcc and fails loudly on a CUDA-capable machine until a real
-      backend exists (it never silently passes).
+- [x] Minimal CUDA backend vertical slice (`tinynn/cuda.py`): 1D Input /
+      Linear / ReLU / Output graphs compile with `nvcc`, execute CUDA kernels
+      on a usable NVIDIA GPU, and compare against the interpreter oracle.
+      `tests/test_cuda.py` skips cleanly when the CUDA compiler or runtime/GPU
+      is unavailable. Broader op coverage remains future work.
 
 ## Tier 6 — Interchange / quantization (mostly complete)
 
