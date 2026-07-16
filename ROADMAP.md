@@ -1,9 +1,5 @@
 # TinyNN Compiler — Tier Roadmap
 
-> NOTE: This file was reconstructed from the project owner's prompt on
-> 2026-07-06 because no roadmap file existed in the repo. Treat it as the
-> source of truth going forward and edit it if the intended roadmap differs.
-
 ## Tier 0 — End-to-end foundation ✅ (complete)
 
 - Shared Graph IR (`tinynn/graph.py`, `tinynn/ops.py`): Input / Linear / ReLU / Output
