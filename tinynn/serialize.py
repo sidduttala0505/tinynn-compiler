@@ -1,8 +1,4 @@
-"""JSON (de)serialization helpers for :class:`tinynn.graph.Graph`.
-
-Thin wrappers around ``Graph.to_dict()`` / ``Graph.from_dict()`` that handle
-file I/O, so callers don't need to juggle ``json`` and ``pathlib`` themselves.
-"""
+"""Save/load a Graph as JSON so you don't have to deal with json + pathlib yourself."""
 
 from __future__ import annotations
 
@@ -16,10 +12,7 @@ PathLike = Union[str, "Path"]
 
 
 def save_json(graph: Graph, path: PathLike) -> Path:
-    """Write ``graph.to_dict()`` as JSON to ``path``.
-
-    Creates parent directories if needed. Returns the ``Path`` written to.
-    """
+    """Dump the graph to a JSON file and return the path."""
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w") as f:
@@ -28,16 +21,7 @@ def save_json(graph: Graph, path: PathLike) -> Path:
 
 
 def load_json(path: PathLike) -> Graph:
-    """Read a JSON file previously written by :func:`save_json` and return a
-    :class:`Graph`.
-
-    Raises
-    ------
-    FileNotFoundError
-        If ``path`` does not exist (propagated from the underlying open()).
-    ValueError
-        If the file contents are not valid JSON.
-    """
+    """Load a graph back from a file written by save_json."""
     in_path = Path(path)
     with in_path.open("r") as f:
         try:
