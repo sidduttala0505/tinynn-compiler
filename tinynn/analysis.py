@@ -1,26 +1,8 @@
-"""Graph analysis utilities for the TinyNN compiler.
+"""Two helpers: sort nodes into a valid order, and recompute shapes.
 
-This module provides standalone helpers that operate on :class:`~tinynn.graph.Node`
-and :class:`~tinynn.graph.Graph` objects but do not modify existing modules:
-
-    - :func:`topological_sort`: order an arbitrary (possibly shuffled) collection
-      of nodes into a valid topological order suitable for ``Graph(...)``.
-    - :func:`infer_shapes`: recompute every node's output shape from first
-      principles, as a documented, standalone consistency check independent of
-      ``Graph.__post_init__``'s validation.
-
-Shape inference rules
-----------------------
-* ``Input`` nodes: shape is whatever was declared on the node.
-* ``Const`` nodes: shape is ``weight.shape`` (1D or 2D). Checked before the
-  "2D weight => Linear-like" rule below, since a Const's value also lives in
-  ``weight`` but it has no inputs.
-* Any node with a 2D ``weight`` (i.e. "Linear-like" -- covers ``Linear`` and any
-  future fused op such as ``FusedLinearReLU``): output shape is
-  ``(weight.shape[1],)``, and the single input's inferred shape must equal
-  ``(weight.shape[0],)``.
-* Any other single-input, weight-less op (``ReLU``, ``Output``, or any future
-  op of the same shape): output shape equals the input's inferred shape.
+infer_shapes mostly duplicates the checks Graph already does at construction,
+but it's handy as a standalone sanity check and it documents the shape rules
+in one place.
 """
 
 from __future__ import annotations
@@ -32,19 +14,11 @@ from .ops import ADD, CONST, INPUT, MATMUL, MUL, SOFTMAX, SUB
 
 
 def topological_sort(nodes) -> Tuple[Node, ...]:
-    """Return ``nodes`` reordered into a valid topological order.
+    """Reorder nodes so every node comes after its inputs (Kahn's algorithm).
 
-    ``nodes`` may be any iterable of :class:`Node` in arbitrary order. Uses
-    Kahn's algorithm. The result is *stable*: among nodes that are ready to be
-    emitted at the same time, nodes that appeared earlier in the input are
-    emitted first. In particular, if ``nodes`` is already topologically
-    sorted, the returned order is identical to the input order.
-
-    Raises
-    ------
-    ValueError
-        If two nodes share a name, if a node references an input name that
-        does not exist among ``nodes``, or if the nodes contain a cycle.
+    Stable - if two nodes are both ready, the one that came first in the input
+    stays first, so an already-sorted list comes back unchanged. Raises if there
+    are duplicate names, a missing input, or a cycle.
     """
     node_list: List[Node] = list(nodes)
 
@@ -70,7 +44,7 @@ def topological_sort(nodes) -> Tuple[Node, ...]:
         for inp in n.inputs:
             dependents[inp].append(n.name)
 
-    # Ready queue, kept ordered by original index so ties resolve stably.
+    # nodes with no remaining deps, kept in original order so ties are stable
     ready: List[str] = sorted(
         (n.name for n in node_list if indegree[n.name] == 0),
         key=lambda nm: order_index[nm],
@@ -102,12 +76,10 @@ def topological_sort(nodes) -> Tuple[Node, ...]:
 
 
 def infer_shapes(graph: Graph) -> Dict[str, Tuple[int, ...]]:
-    """Recompute every node's output shape from first principles.
+    """Work out each node's output shape and return a name -> shape dict.
 
-    Returns a ``name -> shape`` dict. Raises ``ValueError`` if an inferred
-    shape contradicts the node's declared ``.shape`` or if an input-dimension
-    mismatch is found (e.g. a Linear-like node's weight input dimension does
-    not match its input node's shape).
+    Raises if a computed shape doesn't match what the node claims, or if two
+    inputs don't line up (e.g. Linear weight vs its input width).
     """
     inferred: Dict[str, Tuple[int, ...]] = {}
 
@@ -115,14 +87,12 @@ def infer_shapes(graph: Graph) -> Dict[str, Tuple[int, ...]]:
         if node.op == INPUT:
             shape = node.shape
         elif node.op == CONST:
-            # Must come before the "2D weight => Linear-like" branch below: a
-            # 2D Const's value lives in `weight` too, but it has zero inputs
-            # and would otherwise be misclassified as Linear-like and crash
-            # trying to look up a nonexistent input's inferred shape.
+            # has to be checked before the 2D-weight case below - a Const also
+            # keeps its value in `weight` but has no inputs, so it'd get treated
+            # as a Linear and blow up looking for an input that isn't there
             shape = node.weight.shape
         elif node.weight is not None and node.weight.ndim == 2:
-            # Linear-like: Linear, or any future op with a 2D weight
-            # (e.g. FusedLinearReLU).
+            # Linear-like (Linear or FusedLinearReLU): anything with a 2D weight
             if len(node.inputs) != 1:
                 raise ValueError(
                     f"Linear-like node {node.name!r} must have exactly one "
@@ -191,8 +161,7 @@ def infer_shapes(graph: Graph) -> Dict[str, Tuple[int, ...]]:
                 )
             shape = src_shape
         else:
-            # Weight-less single-input op (ReLU, Output, or any future op of
-            # the same shape-preserving kind).
+            # ReLU/Output/Tanh/Sigmoid etc - shape just passes through
             if len(node.inputs) != 1:
                 raise ValueError(
                     f"Node {node.name!r} ({node.op}) must have exactly one "
