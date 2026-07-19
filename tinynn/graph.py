@@ -1,31 +1,14 @@
-"""Graph IR for the TinyNN compiler.
+"""The graph IR - Node, Graph, and a GraphBuilder to make building them less painful.
 
-This module defines the *shared contract* that every later component
-(interpreter, C++ codegen, optimization passes) will consume:
+Everything else (interpreter, codegen, passes) works on these. A few things to
+know:
+  - nodes point at each other by name, not by reference
+  - the node list is kept in topological order (a node only refers to earlier ones)
+  - Node and Graph are frozen, so passes build new graphs instead of editing
+  - validation runs in __post_init__ so you find mistakes right away
 
-    - ``Node``: a single operation in the network.
-    - ``Graph``: an ordered, validated collection of nodes.
-    - ``GraphBuilder``: an ergonomic helper for constructing graphs.
-
-Design notes
-------------
-* Nodes reference each other by ``name`` (string), never by object pointer.
-* A ``Graph`` owns an *ordered* list of nodes and later components assume
-  that order is a valid topological order (a node only references nodes that
-  appear before it).
-* ``Node`` and ``Graph`` are frozen dataclasses: compiler passes should build
-  *new* graphs rather than mutating existing ones. Convenience methods such as
-  ``with_node`` / ``with_output`` return fresh graphs.
-* Validation happens eagerly at construction time so mistakes are caught close
-  to where the graph is built.
-
-Math convention for ``Linear`` (used later by interpreter/codegen)::
-
-    y = x @ weight + bias
-
-where ``x`` has shape ``(in_features,)``, ``weight`` has shape
-``(in_features, out_features)`` and ``bias`` has shape ``(out_features,)``.
-This is *not* PyTorch's default ``(out_features, in_features)`` layout.
+Linear uses y = x @ weight + bias, with weight shaped (in_features, out_features).
+Note this is NOT PyTorch's (out, in) layout.
 """
 
 from __future__ import annotations
@@ -54,7 +37,7 @@ from .ops import (
     TANH,
 )
 
-# Re-export op constants so callers can simply ``from tinynn.graph import LINEAR``.
+# re-export the op constants so you can grab them from here too
 __all__ = [
     "INPUT",
     "LINEAR",
@@ -77,34 +60,18 @@ __all__ = [
     "GraphBuilder",
 ]
 
-# Weights/biases are stored in double precision. Change here if the project
-# ever standardizes on float32.
+# everything's stored as float64
 DTYPE = np.float64
 
 
-# --------------------------------------------------------------------------- #
-# Node
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Node:
-    """A single operation in the graph.
+    """One op in the graph.
 
-    Attributes
-    ----------
-    name:
-        Unique string identifier, e.g. ``"x"``, ``"linear_0"``, ``"relu_0"``.
-    op:
-        Operation type, one of :data:`tinynn.ops.SUPPORTED_OPS`.
-    inputs:
-        Names of nodes whose outputs feed this node (stored as a tuple).
-    shape:
-        Output shape of this node, e.g. ``(128,)``.
-    weight:
-        2D array of shape ``(in_features, out_features)`` for ``Linear`` nodes,
-        otherwise ``None``.
-    bias:
-        1D array of shape ``(out_features,)`` for ``Linear`` nodes, otherwise
-        ``None``.
+    name is a unique id, op is one of the SUPPORTED_OPS, inputs are the names of
+    the nodes feeding this one, shape is the output shape. weight/bias are only
+    set for Linear-ish ops (weight is (in, out), bias is (out,)); Const also uses
+    weight to hold its value.
     """
 
     name: str
@@ -115,8 +82,7 @@ class Node:
     bias: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
-        # Normalize container/array types. ``object.__setattr__`` is required
-        # because the dataclass is frozen.
+        # tidy up the types. have to use object.__setattr__ because it's frozen
         object.__setattr__(self, "inputs", tuple(self.inputs))
         object.__setattr__(self, "shape", tuple(int(d) for d in self.shape))
         if self.weight is not None:
@@ -125,7 +91,6 @@ class Node:
             object.__setattr__(self, "bias", np.asarray(self.bias, dtype=DTYPE))
         self._validate()
 
-    # -- validation -------------------------------------------------------- #
     def _validate(self) -> None:
         if not isinstance(self.name, str) or not self.name:
             raise ValueError(f"Node name must be a non-empty string, got {self.name!r}")
@@ -144,7 +109,7 @@ class Node:
                 f"Node {self.name} shape must be a tuple of positive ints, got {self.shape!r}"
             )
 
-        # Per-op structural rules.
+        # per-op rules
         if self.op == INPUT:
             self._require_no_inputs()
             self._require_no_weights()
@@ -233,9 +198,8 @@ class Node:
                 f"weight shape {expected_shape}"
             )
 
-    # -- serialization ----------------------------------------------------- #
     def to_dict(self) -> Dict[str, Any]:
-        """Return a JSON-friendly dict (NumPy arrays become nested lists)."""
+        """Dict version for JSON - arrays turn into nested lists."""
         return {
             "name": self.name,
             "op": self.op,
@@ -258,21 +222,13 @@ class Node:
             bias=None if bias is None else np.asarray(bias, dtype=DTYPE),
         )
 
-    # -- debug repr -------------------------------------------------------- #
-    def __repr__(self) -> str:  # concise, array-free
+    def __repr__(self) -> str:  # skip the arrays, they're huge
         return f"{self.name}: {self.op} inputs={list(self.inputs)} shape={self.shape}"
 
 
-# --------------------------------------------------------------------------- #
-# Graph
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Graph:
-    """An ordered, validated collection of nodes.
-
-    ``nodes`` is stored as a tuple in dependency (topological) order and
-    ``output_node`` names the node producing the final graph output.
-    """
+    """A validated list of nodes in topological order, plus which one is the output."""
 
     nodes: Tuple[Node, ...]
     output_node: str
@@ -281,7 +237,6 @@ class Graph:
         object.__setattr__(self, "nodes", tuple(self.nodes))
         self._validate()
 
-    # -- validation -------------------------------------------------------- #
     def _validate(self) -> None:
         if not self.nodes:
             raise ValueError("Graph must contain at least one node")
@@ -290,7 +245,7 @@ class Graph:
             if not isinstance(n, Node):
                 raise ValueError(f"Graph nodes must be Node instances, got {type(n).__name__}")
 
-        # Unique names.
+        # names have to be unique
         names = [n.name for n in self.nodes]
         seen_names: set = set()
         for name in names:
@@ -302,7 +257,7 @@ class Graph:
         if self.output_node not in all_names:
             raise ValueError(f"output_node {self.output_node!r} does not exist in the graph")
 
-        # References must point to earlier nodes (enforces topological order).
+        # every input must be defined earlier - this is what keeps things sorted
         defined: set = set()
         node_by_name = {n.name: n for n in self.nodes}
         for node in self.nodes:
@@ -316,7 +271,7 @@ class Graph:
                     )
             defined.add(node.name)
 
-        # Shape compatibility between connected nodes.
+        # check shapes line up between connected nodes
         for node in self.nodes:
             if node.op in (
                 LINEAR,
@@ -392,37 +347,29 @@ class Graph:
                         f"input node {src.name} shape {src.shape}"
                     )
 
-    # -- lookups ----------------------------------------------------------- #
     def node_map(self) -> Dict[str, Node]:
-        """Return a ``name -> Node`` mapping."""
         return {n.name: n for n in self.nodes}
 
     def get_node(self, name: str) -> Node:
-        """Return the node with the given name, or raise ``KeyError``."""
         for n in self.nodes:
             if n.name == name:
                 return n
         raise KeyError(f"No node named {name!r} in graph")
 
     def input_nodes(self) -> List[Node]:
-        """Return all ``Input`` nodes in order."""
         return [n for n in self.nodes if n.op == INPUT]
 
-    # -- immutable rebuild helpers ---------------------------------------- #
+    # these return new graphs since Graph is frozen
     def with_node(self, node: Node) -> "Graph":
-        """Return a new graph with ``node`` appended (original unchanged)."""
         return Graph(nodes=self.nodes + (node,), output_node=self.output_node)
 
     def with_output(self, output_node: str) -> "Graph":
-        """Return a new graph with a different ``output_node``."""
         return Graph(nodes=self.nodes, output_node=output_node)
 
     @classmethod
     def empty(cls) -> "GraphBuilder":
-        """Return a fresh :class:`GraphBuilder` (graphs need >=1 node)."""
         return GraphBuilder()
 
-    # -- serialization ----------------------------------------------------- #
     def to_dict(self) -> Dict[str, Any]:
         return {
             "output_node": self.output_node,
@@ -434,8 +381,8 @@ class Graph:
         nodes = tuple(Node.from_dict(nd) for nd in d["nodes"])
         return cls(nodes=nodes, output_node=d["output_node"])
 
-    # -- debug repr -------------------------------------------------------- #
     def summary(self) -> str:
+        """Human-readable dump of the graph, one line per node."""
         lines = [f"Graph(output_node={self.output_node!r}, nodes=["]
         for n in self.nodes:
             lines.append(f"  {n.name}: {n.op} inputs={list(n.inputs)} shape={n.shape}")
@@ -446,36 +393,29 @@ class Graph:
         return self.summary()
 
 
-# --------------------------------------------------------------------------- #
-# GraphBuilder
-# --------------------------------------------------------------------------- #
 class GraphBuilder:
-    """Mutable helper for constructing an immutable :class:`Graph`.
-
-    Each method appends a node and returns its name so calls chain naturally::
+    """Helper for building a Graph. Each method adds a node and returns its name,
+    so you can chain them:
 
         b = GraphBuilder()
         x = b.input("x", (4,))
-        h = b.linear("linear_0", x, W0, b0)
-        h = b.relu("relu_0", h)
+        h = b.relu("relu_0", b.linear("linear_0", x, W0, b0))
         y = b.linear("linear_1", h, W1, b1)
         graph = b.build(output_node=y)
 
-    Validation is deferred to ``build()``, which constructs a real ``Graph``.
+    Validation doesn't happen until build().
     """
 
     def __init__(self) -> None:
         self._nodes: List[Node] = []
         self._last_output: Optional[str] = None
 
-    # -- internal ---------------------------------------------------------- #
     def _shape_of(self, name: str) -> Tuple[int, ...]:
         for n in self._nodes:
             if n.name == name:
                 return n.shape
         raise ValueError(f"Unknown input node {name!r}; add it before referencing it")
 
-    # -- node constructors ------------------------------------------------- #
     def input(self, name: str, shape: Tuple[int, ...]) -> str:
         self._nodes.append(Node(name=name, op=INPUT, inputs=(), shape=tuple(shape)))
         return name
@@ -498,11 +438,7 @@ class GraphBuilder:
     def quantized_linear(
         self, name: str, input_name: str, weight: np.ndarray, bias: np.ndarray
     ) -> str:
-        """Add a ``QuantizedLinear`` node (see :mod:`tinynn.ops` for semantics).
-
-        Stores the ORIGINAL float64 weight/bias, identically to ``linear``;
-        quantization happens deterministically at eval/codegen time, not here.
-        """
+        # same as linear - we keep the float weights and quantize later
         weight = np.asarray(weight, dtype=DTYPE)
         out_features = (int(weight.shape[1]),) if weight.ndim == 2 else ()
         self._nodes.append(
@@ -628,7 +564,6 @@ class GraphBuilder:
         )
         return name
 
-    # -- finalize ---------------------------------------------------------- #
     def build(self, output_node: Optional[str] = None) -> Graph:
         if output_node is None:
             output_node = self._last_output
