@@ -1,42 +1,13 @@
-"""Optimization passes over the TinyNN Graph IR.
+"""Graph optimization passes.
 
-Every pass is a pure function ``Graph -> Graph``: it never mutates the graph
-it is given (``Graph``/``Node`` are frozen dataclasses anyway) and always
-returns a freshly constructed ``Graph``. This makes passes trivially
-composable and easy to reason about: given the same input graph, a pass
-always produces the same output graph.
+Each pass is just a function that takes a Graph and returns a new one - it never
+edits the input (Graph is frozen anyway). The interpreter is the oracle: an
+optimized graph has to give the same answers as the original.
 
-The NumPy reference interpreter (:func:`tinynn.interpreter.run`) is the
-correctness oracle for every pass in this module: for any input graph and any
-concrete input values, running the *original* graph through the interpreter
-must produce the same output as running the *optimized* graph through the
-interpreter (see ``tests/test_passes.py``).
-
-This module provides:
-
-    * :func:`constant_folding` -- evaluate the constant-only parts of the
-      graph ahead of time, replacing each fully-constant node with a
-      ``Const`` node holding its computed value.
-    * :func:`simplify_algebraic` -- eliminate algebraic-identity nodes
-      (add/sub zero, mul one, redundant ReLU) by aliasing them to an
-      existing node.
-    * :func:`dead_code_elimination` -- drop nodes not reachable (backward,
-      from ``graph.output_node``) from the final output.
-    * :func:`fuse_linear_relu` -- fuse a ``Linear`` node immediately followed
-      by a ``ReLU`` node (and consumed by nothing else) into a single
-      ``FusedLinearReLU`` node.
-    * :func:`quantize_linear` -- replace every ``Linear`` node with an
-      equivalent ``QuantizedLinear`` node (int8 quantized inference; see
-      :mod:`tinynn.ops`). Opt-in: numerically different from float Linear,
-      so it is NOT part of :func:`default_pipeline`.
-    * :func:`quantize_fused_linear_relu` -- replace every ``FusedLinearReLU``
-      node with an equivalent ``QuantizedFusedLinearReLU`` node. Opt-in for
-      the same reason; run after :func:`fuse_linear_relu` to lower
-      ``Linear -> ReLU`` chains to quantized fused form.
-    * :class:`PassManager` -- runs a sequence of passes in order.
-    * :func:`default_pipeline` -- a ``PassManager`` with a sensible default
-      pass order (constant folding, algebraic simplification, dead code
-      elimination, then fusion).
+Passes here: constant_folding, simplify_algebraic, dead_code_elimination,
+fuse_linear_relu, plus quantize_linear / quantize_fused_linear_relu (opt-in,
+they change the numbers). PassManager chains them; default_pipeline() is the
+usual order.
 """
 
 from __future__ import annotations
@@ -73,27 +44,16 @@ __all__ = [
     "default_pipeline",
 ]
 
-# A pass is any callable taking a Graph and returning a new Graph.
 PassFn = Callable[[Graph], Graph]
 
 
-# --------------------------------------------------------------------------- #
-# Constant folding
-# --------------------------------------------------------------------------- #
-# Ops that constant_folding is willing to evaluate ahead of time. Input and
-# Output are deliberately excluded: an Input's value is only known at graph
-# run time, and folding Output would discard the "this is the declared
-# output" marker for no benefit (its value is just a pass-through anyway).
+# ops we're willing to evaluate at compile time. Input isn't here (value only
+# known at runtime) and neither is Output (no point, it's just a passthrough).
 _FOLDABLE_OPS = {ADD, SUB, MUL, MATMUL, SOFTMAX, TANH, SIGMOID, RELU, LINEAR, FUSED_LINEAR_RELU}
 
 
 def _fold_value(node: Node, known: Dict[str, np.ndarray]) -> np.ndarray:
-    """Compute ``node``'s value given that all of its inputs are known constants.
-
-    Mirrors the exact NumPy expression used by :mod:`tinynn.interpreter` for
-    each op, so folding never changes results (beyond ordinary floating point
-    associativity, which the interpreter itself is also subject to).
-    """
+    # same math as the interpreter, just run now instead of at runtime
     if node.op == ADD:
         a, b = known[node.inputs[0]], known[node.inputs[1]]
         return a + b
@@ -127,18 +87,13 @@ def _fold_value(node: Node, known: Dict[str, np.ndarray]) -> np.ndarray:
 
 
 def constant_folding(graph: Graph) -> Graph:
-    """Evaluate fully-constant nodes ahead of time, replacing them with ``Const``.
+    """Precompute nodes whose inputs are all constant and turn them into Consts.
 
-    Performs a single forward scan, keeping a ``name -> np.ndarray`` dict of
-    known-constant values seeded by the graph's existing ``Const`` nodes. A
-    node folds when every one of its inputs is a known constant and its op is
-    one of :data:`_FOLDABLE_OPS` (notably *not* ``Input`` or ``Output``); its
-    value is computed with :func:`_fold_value` and the node is replaced with
-    ``Node(name=<same name>, op=Const, shape=<same shape>, weight=<value>)``.
-    Because the folded node keeps its original name, every downstream
-    reference (including ``graph.output_node``) keeps working unchanged, and
-    a freshly-folded ``Const`` immediately feeds folding of later nodes in the
-    same scan -- so chains of constant computation collapse in one pass.
+    One left-to-right pass. We track the known constant values as we go (starting
+    from the existing Const nodes); when a node's inputs are all known we compute
+    it and swap it for a Const with the same name. Keeping the name means nothing
+    downstream breaks, and the new Const can feed the next fold - so a whole chain
+    of constant math collapses in a single pass.
     """
     known: Dict[str, np.ndarray] = {}
     new_nodes: List[Node] = []
@@ -161,9 +116,6 @@ def constant_folding(graph: Graph) -> Graph:
     return Graph(nodes=tuple(new_nodes), output_node=graph.output_node)
 
 
-# --------------------------------------------------------------------------- #
-# Algebraic simplification
-# --------------------------------------------------------------------------- #
 def _is_zero_const(node: Optional[Node]) -> bool:
     return node is not None and node.op == CONST and bool(np.all(node.weight == 0.0))
 
@@ -173,15 +125,9 @@ def _is_one_const(node: Optional[Node]) -> bool:
 
 
 def _simplify_algebraic_once(graph: Graph) -> Tuple[Graph, bool]:
-    """Run a single scan+rebuild of the algebraic simplification rules.
-
-    Returns ``(new_graph, changed)``. Scans in order, building a
-    ``name -> name`` replacement map (resolving chains through the map as it
-    goes, so an operand that was itself just replaced resolves to its final
-    target within the same scan); then rebuilds the graph once: dropping
-    replaced nodes, rewriting every surviving node's inputs through the
-    resolved map, and mapping ``output_node`` through it too.
-    """
+    # one scan + rebuild. builds a name->name "replace this with that" map, then
+    # rewrites every node's inputs (and the output) through it. returns
+    # (new_graph, did_anything).
     node_by_name: Dict[str, Node] = graph.node_map()
     replacement: Dict[str, str] = {}
 
@@ -200,8 +146,7 @@ def _simplify_algebraic_once(graph: Graph) -> Tuple[Graph, bool]:
             elif _is_zero_const(node_by_name.get(b)):
                 alias = a
         elif node.op == SUB:
-            # Only Sub(x, c) with c == 0 simplifies to x; Sub(c, x) == c - x
-            # is not an identity (it's negation), so operand order matters.
+            # only x - 0 simplifies. 0 - x is negation, not an identity, so order matters
             a, b = resolve(node.inputs[0]), resolve(node.inputs[1])
             if _is_zero_const(node_by_name.get(b)):
                 alias = a
@@ -248,26 +193,17 @@ def _simplify_algebraic_once(graph: Graph) -> Tuple[Graph, bool]:
 
 
 def simplify_algebraic(graph: Graph) -> Graph:
-    """Eliminate algebraic-identity nodes by aliasing them to an existing node.
+    """Drop no-op nodes by pointing whatever used them at their real input.
 
-    Exactly four rules, applied by aliasing the identity node's name to an
-    existing node's name (never mutating values):
+    The rules:
+      - x + 0  or  0 + x   ->  x
+      - x - 0              ->  x   (but not 0 - x)
+      - x * 1  or  1 * x   ->  x
+      - relu(relu(x))      ->  relu(x)   (relu, and the fused relu ops, are
+                                          idempotent - output's already >= 0)
 
-        * ``Add(x, c)`` or ``Add(c, x)`` where ``c`` is a ``Const`` of all
-          zeros (same shape as ``x``) -> alias to ``x``.
-        * ``Sub(x, c)`` where ``c`` is all zeros -> alias to ``x`` (only this
-          operand order; ``Sub(c, x)`` is negation, not an identity).
-        * ``Mul(x, c)`` or ``Mul(c, x)`` where ``c`` is a ``Const`` of all
-          ones -> alias to ``x``.
-        * ``ReLU`` whose single input is itself a ``ReLU``,
-          ``FusedLinearReLU``, or ``QuantizedFusedLinearReLU`` node -> alias
-          to that input (``relu`` is idempotent and those fused outputs are
-          already clamped at 0).
-
-    Runs the scan+rebuild in :func:`_simplify_algebraic_once` to a fixpoint
-    (stopping as soon as a scan makes no changes, with a hard cap of 10
-    iterations) so stacked identities -- e.g. ``Add(Add(x, zeros), zeros)``
-    -- fully collapse.
+    Runs until nothing changes (capped at 10 rounds) so stacked no-ops like
+    (x + 0) + 0 collapse all the way.
     """
     for _ in range(10):
         graph, changed = _simplify_algebraic_once(graph)
@@ -276,16 +212,11 @@ def simplify_algebraic(graph: Graph) -> Graph:
     return graph
 
 
-# --------------------------------------------------------------------------- #
-# Dead code elimination
-# --------------------------------------------------------------------------- #
 def dead_code_elimination(graph: Graph) -> Graph:
-    """Return a new graph containing only nodes reachable from the output.
+    """Keep only the nodes the output actually depends on; drop the rest.
 
-    A node is *live* if it is (transitively) an input of ``graph.output_node``,
-    including ``graph.output_node`` itself. Dead nodes (e.g. an ``Input`` node
-    whose value is never consumed, or a whole unused branch) are dropped.
-    Relative order of the surviving nodes is preserved.
+    Walk backwards from output_node collecting everything reachable, then throw
+    away anything we didn't hit (unused branches, dead inputs, ...).
     """
     node_by_name: Dict[str, Node] = graph.node_map()
 
@@ -303,41 +234,26 @@ def dead_code_elimination(graph: Graph) -> Graph:
     return Graph(nodes=kept, output_node=graph.output_node)
 
 
-# --------------------------------------------------------------------------- #
-# Linear + ReLU fusion
-# --------------------------------------------------------------------------- #
 def fuse_linear_relu(graph: Graph) -> Graph:
-    """Fuse ``Linear -> ReLU`` pairs into a single ``FusedLinearReLU`` node.
+    """Merge a Linear directly followed by a ReLU into one FusedLinearReLU node.
 
-    A ``Linear`` node ``l`` and the ``ReLU`` node ``r`` that consumes it are
-    fused when:
-
-        * ``r`` has exactly one input, ``l``;
-        * ``l`` is consumed by nothing *other* than ``r`` (fusing would
-          otherwise discard a value some other node still needs); and
-        * ``l`` is not ``graph.output_node`` (fusing would otherwise discard
-          the pre-activation value the graph is supposed to expose).
-
-    The fused node is placed at ``l``'s position in the node order and takes
-    ``r``'s name, so any node referencing ``r`` (including ``output_node``)
-    keeps working unchanged. A single left-to-right scan is sufficient to
-    fuse chains such as ``Linear -> ReLU -> Linear -> ReLU``, since each fused
-    node is emitted before later nodes are examined.
+    Only fuse when the ReLU's single input is the Linear, nothing else uses that
+    Linear, and the Linear isn't the graph output (we'd lose the pre-activation
+    value otherwise). The fused node takes the ReLU's name and the Linear's spot,
+    so references still resolve. One left-to-right pass handles chains fine.
     """
     nodes = graph.nodes
     node_by_name: Dict[str, Node] = {n.name: n for n in nodes}
 
-    # Count how many nodes consume each node's output (output_node is treated
-    # as an implicit extra consumer of whatever it points to).
+    # how many things use each node (the output counts as one extra user)
     consumer_count: Dict[str, int] = {n.name: 0 for n in nodes}
     for n in nodes:
         for inp in n.inputs:
             consumer_count[inp] += 1
     consumer_count[graph.output_node] += 1
 
-    # Find every Linear node `l` with a fusable ReLU consumer `r`: r's only
-    # input is l, l has no other consumer, and l is not the graph output.
-    fuse_partner: Dict[str, Node] = {}  # Linear name -> its fusable ReLU node.
+    # map each fusable Linear to the ReLU that eats it
+    fuse_partner: Dict[str, Node] = {}
     for n in nodes:
         if (
             n.op == RELU
@@ -352,8 +268,7 @@ def fuse_linear_relu(graph: Graph) -> Graph:
             ):
                 fuse_partner[src.name] = n
 
-    # Emit each fused pair at the Linear node's position (taking the ReLU's
-    # name), and drop the ReLU node when we reach its original position.
+    # emit the fused node where the Linear was, and skip the ReLU later on
     fused_relu_names = {r.name for r in fuse_partner.values()}
     new_nodes: List[Node] = []
     for node in nodes:
@@ -370,33 +285,19 @@ def fuse_linear_relu(graph: Graph) -> Graph:
                 )
             )
         elif node.name in fused_relu_names:
-            continue  # already emitted (fused) at its Linear's position.
+            continue  # already handled at the Linear's spot
         else:
             new_nodes.append(node)
 
     return Graph(nodes=tuple(new_nodes), output_node=graph.output_node)
 
 
-# --------------------------------------------------------------------------- #
-# Int8 quantization (Tier 6)
-# --------------------------------------------------------------------------- #
 def quantize_linear(graph: Graph) -> Graph:
-    """Replace every ``Linear`` node with an equivalent ``QuantizedLinear`` node.
+    """Swap every Linear node for a QuantizedLinear (same name/weights/etc).
 
-    Each ``Linear`` node is swapped 1:1 for a ``QuantizedLinear`` node with
-    the identical name, inputs, shape, weight and bias -- so every reference
-    to it (including ``graph.output_node``) keeps working unchanged, and the
-    replacement is purely a change of *op* (float matmul -> int8 quantized
-    matmul); see :mod:`tinynn.ops` for the exact quantized semantics.
-
-    ``FusedLinearReLU`` nodes are deliberately left untouched -- use
-    :func:`quantize_fused_linear_relu` to quantize those. Running both
-    passes (in either order) after :func:`fuse_linear_relu` lowers every
-    fused pair to ``QuantizedFusedLinearReLU`` and every remaining bare
-    ``Linear`` to ``QuantizedLinear``.
-
-    Not part of :func:`default_pipeline`: quantization changes numerics
-    (int8 rounding + rescale), so callers must opt in explicitly.
+    Only the op changes (float -> int8). FusedLinearReLU is left alone - use
+    quantize_fused_linear_relu for those. Not in default_pipeline since it
+    changes the actual numbers - you opt in.
     """
     new_nodes: List[Node] = []
     for node in graph.nodes:
@@ -418,19 +319,11 @@ def quantize_linear(graph: Graph) -> Graph:
 
 
 def quantize_fused_linear_relu(graph: Graph) -> Graph:
-    """Replace every ``FusedLinearReLU`` node with ``QuantizedFusedLinearReLU``.
+    """Like quantize_linear but for FusedLinearReLU -> QuantizedFusedLinearReLU.
 
-    Each ``FusedLinearReLU`` node is swapped 1:1 for a
-    ``QuantizedFusedLinearReLU`` node with the identical name, inputs, shape,
-    weight and bias -- purely a change of *op* (float fused matmul+ReLU ->
-    int8 quantized matmul, rescale + bias, then the ReLU clamp last; see
-    :mod:`tinynn.ops` for the exact semantics). Bare ``Linear`` nodes are
-    left untouched -- use :func:`quantize_linear` for those. To lower a
-    ``Linear -> ReLU`` chain to quantized fused form, run
-    :func:`fuse_linear_relu` first, then this pass.
-
-    Not part of :func:`default_pipeline`: quantization changes numerics
-    (int8 rounding + rescale), so callers must opt in explicitly.
+    Only the op changes. Bare Linears are left for quantize_linear. To quantize a
+    Linear -> ReLU chain, run fuse_linear_relu first, then this. Opt-in (changes
+    the numbers), not in default_pipeline.
     """
     new_nodes: List[Node] = []
     for node in graph.nodes:
@@ -451,15 +344,9 @@ def quantize_fused_linear_relu(graph: Graph) -> Graph:
     return Graph(nodes=tuple(new_nodes), output_node=graph.output_node)
 
 
-# --------------------------------------------------------------------------- #
-# Pass manager
-# --------------------------------------------------------------------------- #
 class PassManager:
-    """Runs a sequence of ``Graph -> Graph`` passes in order.
-
-    ``passes`` may be plain functions (each used as its own name) or
-    ``(name, fn)`` pairs.
-    """
+    """Runs a list of passes one after another. Each pass can be a plain function
+    or a (name, function) pair."""
 
     def __init__(self, passes: Sequence[object]) -> None:
         self._passes: Tuple[Tuple[str, PassFn], ...] = tuple(
@@ -484,14 +371,8 @@ class PassManager:
 
 
 def default_pipeline() -> PassManager:
-    """Return the default optimization pipeline.
-
-    Order: constant folding (creates ``Const`` nodes, some now dead), then
-    algebraic simplification (creates more dead nodes, e.g. eliminated
-    zero/one Consts and redundant ReLUs), then dead code elimination (sweeps
-    every orphaned node left behind by the previous two passes), then
-    Linear+ReLU fusion last.
-    """
+    # fold first (makes dead consts), then simplify (makes more dead nodes),
+    # then DCE to sweep them all up, then fuse. order matters here.
     return PassManager(
         [constant_folding, simplify_algebraic, dead_code_elimination, fuse_linear_relu]
     )
