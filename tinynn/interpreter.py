@@ -1,9 +1,7 @@
-"""Reference NumPy interpreter for the TinyNN Graph IR.
+"""NumPy interpreter - the reference we check everything else against.
 
-``run`` walks a :class:`tinynn.graph.Graph` in its stored (topological) order,
-evaluating each node with plain NumPy, and returns the value produced by the
-graph's declared output node. This module owns no IR types of its own -- it
-consumes the shared ``Node``/``Graph`` dataclasses from :mod:`tinynn.graph`.
+run() just walks the graph in order and evaluates each node with plain numpy,
+then hands back the output node's value.
 """
 
 from __future__ import annotations
@@ -35,41 +33,25 @@ Inputs = Union[Dict[str, np.ndarray], np.ndarray]
 
 
 def _quantize_symmetric(v: np.ndarray):
-    """Symmetric int8 quantization of ``v``, shared by weight and activation.
+    """int8 quantize v symmetrically. Returns (int64 levels in [-127,127], scale).
 
-    Returns ``(q, scale)`` where ``q`` is an ``int64`` array holding the
-    quantized (integer-valued) levels in ``[-127, 127]`` and ``scale`` is the
-    float scale such that ``q * scale`` approximates ``v``.
-
-    ``scale = max(abs(v)) / 127.0``, or ``1.0`` if ``v`` is all zeros (avoids
-    division by zero; any scale works when every quantized value is 0).
-
-    Rounding MUST match C++ ``std::lround`` (round half away from zero), NOT
-    NumPy's ``np.round`` (round half to even) -- so we round manually via
-    ``sign(v) * floor(abs(v) + 0.5)`` instead of calling ``np.round``.
+    scale is max(abs(v))/127, or 1.0 if v is all zeros so we don't divide by 0.
+    Rounding has to match C++ std::lround (round half away from zero), so I do it
+    by hand - np.round rounds half to even and would disagree with the C++.
     """
     maxabs = float(np.max(np.abs(v)))
     scale = maxabs / 127.0 if maxabs > 0.0 else 1.0
     scaled = v / scale
-    # Round half away from zero (matches std::lround), not np.round's
-    # round-half-to-even.
-    rounded = np.sign(scaled) * np.floor(np.abs(scaled) + 0.5)
+    rounded = np.sign(scaled) * np.floor(np.abs(scaled) + 0.5)  # half away from zero
     clipped = np.clip(rounded, -127, 127)
     q = clipped.astype(np.int64)
     return q, scale
 
 
 def _eval_quantized_linear(x: np.ndarray, weight: np.ndarray, bias: np.ndarray) -> np.ndarray:
-    """Reference NumPy implementation of the ``QuantizedLinear`` op.
-
-    Weight quantization uses the node's stored float weight (deterministic,
-    independent of any particular call); activation quantization is computed
-    fresh from ``x`` on every call. Both quantized arrays are cast to
-    ``int64`` BEFORE the matmul so the accumulation itself is pure integer
-    arithmetic, matching the C++ side's ``long long acc`` accumulator
-    exactly; only the final rescale (times scale product) and bias add use
-    floating point.
-    """
+    # cast to int64 before the matmul so the accumulation is real integer math,
+    # exactly like the `long long acc` in the generated C++. only the final
+    # rescale and bias add are floating point.
     x_q, s_x = _quantize_symmetric(x)
     w_q, s_w = _quantize_symmetric(weight)
     acc = x_q.astype(np.int64) @ w_q.astype(np.int64)
@@ -77,11 +59,10 @@ def _eval_quantized_linear(x: np.ndarray, weight: np.ndarray, bias: np.ndarray) 
 
 
 def run(graph: Graph, inputs: Inputs) -> np.ndarray:
-    """Evaluate ``graph`` on ``inputs`` and return the output node's value.
+    """Run the graph and return the output value.
 
-    ``inputs`` may be a ``dict`` mapping Input-node names to arrays, or a bare
-    array/array-like -- but a bare value is only accepted when ``graph`` has
-    exactly one Input node.
+    inputs is either a {name: array} dict, or a bare array if there's only one
+    Input node.
     """
     provided = _resolve_inputs(graph, inputs)
 
@@ -104,9 +85,7 @@ def run(graph: Graph, inputs: Inputs) -> np.ndarray:
             x = _single_input_value(node, values)
             values[node.name] = _eval_quantized_linear(x, node.weight, node.bias)
         elif node.op == QUANTIZED_FUSED_LINEAR_RELU:
-            # Same quantized matmul as QuantizedLinear; the ReLU clamp is
-            # applied LAST, after the float rescale + bias add (see
-            # tinynn.ops).
+            # same as QuantizedLinear but max(0, ...) on the end
             x = _single_input_value(node, values)
             values[node.name] = np.maximum(
                 _eval_quantized_linear(x, node.weight, node.bias), 0.0
@@ -145,7 +124,7 @@ def run(graph: Graph, inputs: Inputs) -> np.ndarray:
 
 
 def _resolve_inputs(graph: Graph, inputs: Inputs) -> Dict[str, np.ndarray]:
-    """Normalize ``inputs`` to a ``name -> array`` dict."""
+    # turn a bare array into a {name: array} dict if we can
     if isinstance(inputs, dict):
         return inputs
 
