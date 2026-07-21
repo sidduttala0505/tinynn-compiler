@@ -1,35 +1,16 @@
-"""C++ code generator + compiler driver for the TinyNN Graph IR.
+"""Generate C++ from a graph and compile it with g++.
 
-This module turns a validated :class:`tinynn.graph.Graph` into a small,
-readable, standalone C++ program and compiles it with a system C++ compiler
-(``g++`` by default). The generated program:
+The generated program reads each Input from stdin (in graph order, as plain
+doubles), computes everything with flat std::vector<double> and simple loops,
+and prints the output to stdout. Tensors are always flat row-major no matter
+their rank; CompiledModel reshapes the result back on the Python side.
 
-    * reads each graph ``Input`` node's values, in graph order, as
-      whitespace-separated doubles from ``stdin``,
-    * evaluates the graph using plain ``std::vector<double>`` values (flat,
-      row-major) and simple loops,
-    * prints the values of ``graph.output_node`` to ``stdout`` as
-      whitespace-separated doubles followed by a newline.
-
-Tier 2 scope: one or more ``Input`` nodes, node shapes are 1D or 2D (rank 0
-and rank >=3 are rejected). Tensors are always represented as flat,
-row-major ``std::vector<double>`` regardless of logical rank; the Python
-side (:class:`CompiledModel`) is responsible for reshaping results back to
-their declared shape.
-
-Tier 4 adds two independent features to the generated program and its driver:
-
-    * repeated-execution / timing support (``argv``-controlled ``iters`` /
-      ``warmup``, a timed compute loop, and a ``BENCH_NS ... CHECKSUM ...``
-      line on stderr) so :meth:`CompiledModel.benchmark` can measure
-      steady-state per-iteration wall time without spawning a new process
-      per repetition, and
-    * :class:`CodegenOptions`, an opt-in set of CPU optimizations (loop
-      interchange / cache tiling, ``-O3``/``-march=native``, and
-      option-gated OpenMP) applied by :func:`generate_cpp` /
-      :func:`compile_graph` when passed explicitly. Passing no options (the
-      default, ``None``) reproduces the exact naive/``-O2`` behavior of
-      earlier tiers, byte-for-byte on stdout.
+Two extra things live here beyond basic codegen:
+  - the generated binary can loop the compute `iters` times (with `warmup`)
+    and print timing to stderr, so benchmark() doesn't measure process startup
+  - CodegenOptions turns on faster codegen (loop tiling, -O3/-march=native,
+    OpenMP if the compiler has it). Pass options=None and you get the plain
+    -O2 version, exactly like before.
 """
 
 from __future__ import annotations
@@ -71,8 +52,7 @@ __all__ = [
     "openmp_available",
 ]
 
-# Maximum characters per line for wrapped array-literal source, kept small so
-# generated files stay readable in a normal editor/terminal.
+# wrap the weight/bias array literals so the generated file isn't one huge line
 _WRAP_WIDTH = 88
 
 _INVALID_CHARS_RE = re.compile(r"[^A-Za-z0-9_]")
@@ -80,26 +60,19 @@ _INVALID_CHARS_RE = re.compile(r"[^A-Za-z0-9_]")
 _BENCH_RE = re.compile(r"BENCH_NS\s+(-?\d+)\s+CHECKSUM\s+(\S+)")
 
 
-# --------------------------------------------------------------------------- #
-# Name sanitization
-# --------------------------------------------------------------------------- #
 def sanitize_name(name: str) -> str:
-    """Turn an arbitrary node name into a valid, ``v_``-prefixed C++ identifier.
+    """Make a node name into a legal C++ identifier (prefix v_, junk chars -> _).
 
-    Any character outside ``[A-Za-z0-9_]`` is replaced with ``_``. This does
-    *not* de-duplicate collisions across a whole graph; use
-    :func:`_build_identifier_map` for that.
+    Doesn't handle collisions - _build_identifier_map does that.
     """
     return "v_" + _INVALID_CHARS_RE.sub("_", name)
 
 
 def _build_identifier_map(graph: Graph) -> Dict[str, str]:
-    """Map each node name to a unique, sanitized C++ identifier.
+    """node name -> unique C++ identifier.
 
-    Two distinct node names can sanitize to the same identifier (e.g.
-    ``"a.b"`` and ``"a-b"`` both become ``v_a_b``). When that happens we
-    de-duplicate by appending ``_2``, ``_3``, ... to later collisions, in
-    graph node order.
+    Two names can sanitize to the same thing (e.g. "a.b" and "a-b" both give
+    v_a_b), so tack on _2, _3, ... when that happens.
     """
     used: Dict[str, int] = {}
     mapping: Dict[str, str] = {}
@@ -111,8 +84,7 @@ def _build_identifier_map(graph: Graph) -> Dict[str, str]:
         else:
             used[base] += 1
             candidate = f"{base}_{used[base]}"
-            # Guard against a pathological case where the bumped candidate
-            # itself collides with something already assigned.
+            # just in case the bumped name also clashes with something
             while candidate in used:
                 used[base] += 1
                 candidate = f"{base}_{used[base]}"
@@ -121,9 +93,6 @@ def _build_identifier_map(graph: Graph) -> Dict[str, str]:
     return mapping
 
 
-# --------------------------------------------------------------------------- #
-# Validation
-# --------------------------------------------------------------------------- #
 _SUPPORTED = {
     INPUT,
     LINEAR,
@@ -144,7 +113,7 @@ _SUPPORTED = {
 
 
 def _numel(shape: Tuple[int, ...]) -> int:
-    """Return the number of elements in ``shape`` (product of dimensions)."""
+    # product of the dims
     n = 1
     for d in shape:
         n *= d
@@ -177,11 +146,8 @@ def _validate_for_codegen(graph: Graph) -> None:
         defined.add(node.name)
 
 
-# --------------------------------------------------------------------------- #
-# C++ literal formatting
-# --------------------------------------------------------------------------- #
 def _format_double_array(values: np.ndarray) -> str:
-    """Format a 1D array as a wrapped, comma-separated C++ initializer body."""
+    """Turn an array into a comma-separated C++ initializer body, line-wrapped."""
     tokens = [format(float(v), ".17g") for v in values.ravel(order="C")]
     if not tokens:
         return ""
@@ -199,11 +165,7 @@ def _format_double_array(values: np.ndarray) -> str:
 
 
 def _format_int_array(values: np.ndarray) -> str:
-    """Format an integer-valued array as a wrapped C++ initializer body.
-
-    Used for the ``long long`` quantized-weight globals -- values are plain
-    integer literals (no decimal point), unlike :func:`_format_double_array`.
-    """
+    # same as _format_double_array but for the int8 quantized weights (no decimal point)
     tokens = [str(int(v)) for v in values.ravel(order="C")]
     if not tokens:
         return ""
@@ -220,22 +182,11 @@ def _format_int_array(values: np.ndarray) -> str:
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------- #
-# Quantization (Tier 6, QuantizedLinear)
-# --------------------------------------------------------------------------- #
 def _quantize_weight_for_codegen(weight: np.ndarray):
-    """Quantize a Linear-style float64 weight matrix at C++-generation time.
+    """Quantize the weight now, at codegen time. Returns (int levels, scale).
 
-    Mirrors :func:`tinynn.interpreter._quantize_symmetric` exactly (same
-    scale formula, same round-half-away-from-zero rounding via
-    ``sign(v) * floor(abs(v) + 0.5)`` rather than NumPy's round-half-to-even
-    ``np.round``) so the weight quantization baked into the generated C++
-    source is bit-for-bit identical to what the interpreter computes for the
-    same node at eval time.
-
-    Returns ``(w_q, s_w)``: ``w_q`` an ``int64`` array of the same shape as
-    ``weight`` holding integer levels in ``[-127, 127]``, and ``s_w`` the
-    float scale.
+    Same math as interpreter._quantize_symmetric so the numbers baked into the
+    C++ match what the interpreter would compute.
     """
     maxabs = float(np.max(np.abs(weight)))
     s_w = maxabs / 127.0 if maxabs > 0.0 else 1.0
@@ -246,43 +197,18 @@ def _quantize_weight_for_codegen(weight: np.ndarray):
     return w_q, s_w
 
 
-# --------------------------------------------------------------------------- #
-# Codegen options
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class CodegenOptions:
-    """Opt-in CPU codegen/compile optimizations.
+    """Knobs for the faster codegen path. Pass options=None to get the plain
+    version.
 
-    ``generate_cpp``/``compile_graph`` treat ``options=None`` as "exactly
-    today's naive emission, compiled with ``-O2``" -- passing an explicit
-    ``CodegenOptions`` (even ``CodegenOptions()`` with all defaults) switches
-    on the option-driven code paths below, though with every field at its
-    default it still emits the naive form (only ``opt_level`` changes vs.
-    ``None``).
-
-    Attributes
-    ----------
-    opt_level:
-        Compiler optimization flag, e.g. ``"-O2"``/``"-O3"``.
-    native:
-        When true, add ``-march=native`` to the compile command.
-    tile_size:
-        When set, enables loop interchange for Linear/FusedLinearReLU and
-        cache-blocked tiling (tile size ``tile_size``) for MatMul.
-    openmp:
-        When true, emit ``#pragma omp parallel for`` above race-free outer
-        loops and add ``-fopenmp`` to the compile command. Callers are
-        responsible for checking :func:`openmp_available` first -- this
-        module does not silently fall back if the compiler rejects
-        ``-fopenmp``.
-    reuse_buffers:
-        When true, run liveness-based, exact-size greedy slot assignment
-        over every non-Input, non-Const node's buffer so the generated
-        program allocates fewer, reused ``std::vector<double>`` physical
-        slots instead of one per node (see :func:`_plan_buffer_reuse`).
-        Purely a memory-footprint optimization -- computed values are
-        unchanged. Left out of :meth:`fast` so benchmark comparisons across
-        that preset stay apples-to-apples.
+    - opt_level: the -O flag
+    - native: add -march=native
+    - tile_size: loop interchange for Linear/Fused and cache tiling for MatMul
+    - openmp: add #pragma omp + -fopenmp (check openmp_available() yourself first)
+    - reuse_buffers: pack node buffers into fewer reused slots (see
+      _plan_buffer_reuse). Doesn't change any results, just memory. Left out of
+      fast() so benchmarks stay comparable.
     """
 
     opt_level: str = "-O2"
@@ -293,7 +219,7 @@ class CodegenOptions:
 
     @classmethod
     def fast(cls, openmp: bool = False) -> "CodegenOptions":
-        """A reasonable "fast" preset: ``-O3 -march=native``, tiled, optionally OpenMP."""
+        # -O3, native, tiled - the "just make it fast" preset
         return cls(opt_level="-O3", native=True, tile_size=32, openmp=openmp)
 
 
@@ -301,13 +227,10 @@ _openmp_availability_cache: Dict[str, bool] = {}
 
 
 def openmp_available(compiler: str = "g++") -> bool:
-    """Return whether ``compiler`` accepts ``-fopenmp`` on this machine.
+    """Does this compiler accept -fopenmp? Tries compiling a tiny test program.
 
-    Trial-compiles a tiny OpenMP program in a temporary directory. The
-    result is cached per ``compiler`` for the lifetime of the process (this
-    is a real subprocess compile, so callers should not call it in a hot
-    loop). On a machine whose ``g++`` is actually Apple clang (no bundled
-    OpenMP runtime), this returns ``False``.
+    Cached per compiler since it actually shells out. Returns False on macOS
+    where g++ is really Apple clang without OpenMP.
     """
     if compiler in _openmp_availability_cache:
         return _openmp_availability_cache[compiler]
@@ -332,39 +255,21 @@ def openmp_available(compiler: str = "g++") -> bool:
     return ok
 
 
-# --------------------------------------------------------------------------- #
-# Buffer reuse planning (options.reuse_buffers)
-# --------------------------------------------------------------------------- #
 def _plan_buffer_reuse(graph: Graph) -> Tuple[Dict[str, int], List[int]]:
-    """Liveness-based, exact-size greedy slot assignment for node buffers.
+    """Figure out which node buffers can share memory.
 
-    Every non-Input, non-Const node owns one logical buffer (Input buffers
-    are filled once in the prelude but re-read on every repetition of the
-    compute loop, so they are never reusable; Const values are emitted as
-    global static arrays and are not buffers at all). This function maps
-    each logical buffer to a *physical slot* index such that slots are
-    reused across non-overlapping lifetimes.
+    Each non-Input, non-Const node needs one buffer (Inputs get re-read every
+    iteration so they can't be shared; Consts are global arrays, not buffers).
+    We give each one a physical slot, reusing a slot once its previous owner is
+    done with it.
 
-    Liveness: a buffer's last use is the maximum node index among (a) every
-    node that consumes it as an input, (b) the producing node itself, and
-    (c) +infinity when it belongs to ``graph.output_node`` -- the output
-    buffer is read *after* the compute loop (checksum + printing), so it is
-    never reusable.
+    "Done with it" = last node that reads it (or the node itself). The output
+    node's buffer is read after the loop, so it never gets reused. A slot only
+    frees for a node whose index is STRICTLY past the last use of the current
+    owner - that strict > stops a node ever getting one of its own inputs as its
+    output buffer, which would break MatMul/Linear/Softmax.
 
-    Assignment: scanning nodes in graph order, a node needing ``numel`` s
-    reuses a free slot of numel EXACTLY s if one exists, else opens a new
-    slot. A slot becomes free only for nodes whose index is STRICTLY
-    GREATER than the last-use index of its previous occupant.
-
-    Invariant (why in-place aliasing can never happen): any buffer consumed
-    as an input by node ``i`` has last use >= ``i``, so under the
-    strictly-greater-than rule it cannot be free when node ``i``'s output
-    slot is chosen -- a node is never handed one of its own input buffers.
-    This matters because MatMul, Linear, and Softmax read their inputs
-    repeatedly while writing their output.
-
-    Returns ``(assignment, slot_sizes)`` where ``assignment`` maps node
-    name -> slot index and ``slot_sizes[k]`` is slot ``k``'s element count.
+    Returns (node name -> slot index, list of slot sizes).
     """
     node_index = {node.name: i for i, node in enumerate(graph.nodes)}
     planned = [n for n in graph.nodes if n.op not in (INPUT, CONST)]
@@ -386,8 +291,7 @@ def _plan_buffer_reuse(graph: Graph) -> Tuple[Dict[str, int], List[int]]:
         size = _numel(node.shape)
         chosen: Optional[int] = None
         for k in range(len(slot_sizes)):
-            # Exact-size match, and free only STRICTLY AFTER the previous
-            # occupant's last use (see invariant in the docstring).
+            # same size, and the old owner has to be strictly done (see docstring)
             if slot_sizes[k] == size and i > slot_last_use[k]:
                 chosen = k
                 break
@@ -408,9 +312,8 @@ def _emit_reuse_decl_lines(
     assignment: Dict[str, int],
     slot_sizes: List[int],
 ) -> List[str]:
-    """Emit the decl section for a buffer-reuse plan: physical slots first,
-    then one reference per logical buffer so all compute code (which refers
-    to the per-node identifiers) is unchanged."""
+    # declare the physical slots, then a reference per node pointing at its slot,
+    # so the compute code (which uses the per-node names) doesn't have to change
     lines: List[str] = []
     lines.append("    // Physical buffer slots (reuse_buffers=on).")
     lines.append("    // Invariant: a slot is handed to the node at index i only when i is")
@@ -434,38 +337,15 @@ def _emit_reuse_decl_lines(
     return lines
 
 
-# --------------------------------------------------------------------------- #
-# C++ source generation
-# --------------------------------------------------------------------------- #
 def generate_cpp(graph: Graph, options: Optional[CodegenOptions] = None) -> str:
-    """Generate readable, standalone C++ source implementing ``graph``.
+    """Build the C++ source for a graph and return it as a string.
 
-    The generated program reads every graph Input node from stdin, in graph
-    order (whitespace-separated doubles, ``_numel(shape)`` values per Input
-    node), once. It then computes the graph once (default invocation,
-    ``argc == 1``) or ``iters`` times (after ``warmup`` untimed repetitions)
-    when invoked as ``<binary> <iters> <warmup>``, writing the *final*
-    repetition's output node values to stdout exactly as before. Passing
-    explicit ``iters`` > 1 additionally prints one line to stderr:
-    ``BENCH_NS <total_nanoseconds> CHECKSUM <checksum>``.
+    The program reads the inputs from stdin, computes the graph, and prints the
+    output. Run it with `<binary> <iters> <warmup>` and it loops the compute and
+    prints timing to stderr; run it with no args and it just does it once.
 
-    ``options`` is ``None`` by default, which reproduces the exact naive
-    per-op C++ emitted by earlier tiers (only the repeat/timing scaffolding
-    around it is new -- with ``iters=1, warmup=0`` -- the default when no
-    argv is given -- stdout is byte-identical to before). Passing a
-    :class:`CodegenOptions` with ``tile_size`` set switches Linear /
-    FusedLinearReLU to loop-interchanged accumulation and MatMul to
-    cache-blocked tiling; ``openmp=True`` additionally emits
-    ``#pragma omp parallel for`` above race-free outer loops (Linear/Fused
-    always use the naive j-outer form under OpenMP, since the interchanged
-    accumulation races across the parallelized dimension -- see inline
-    comments below).
-
-    ``reuse_buffers=True`` replaces the one-``std::vector``-per-node decl
-    section with a set of physical buffer slots plus one reference per node
-    (see :func:`_plan_buffer_reuse`); compute statements are unchanged and
-    the computed values are identical. With ``reuse_buffers=False`` the
-    emission is byte-identical to not having the feature at all.
+    options=None gives the plain version. With a CodegenOptions you get the tiled
+    loops, and reuse_buffers packs the buffers (same results either way).
     """
     _validate_for_codegen(graph)
     ids = _build_identifier_map(graph)
@@ -504,10 +384,8 @@ def generate_cpp(graph: Graph, options: Optional[CodegenOptions] = None) -> str:
     lines.append("#include <chrono>")
     lines.append("")
 
-    # Global static weight/bias arrays for Linear (and FusedLinearReLU) nodes,
-    # plus a global static array for each Const node's value. Const globals
-    # are referenced directly by name (no separate decl-section entry, no
-    # compute statement) by whichever downstream op consumes them.
+    # emit the weight/bias arrays (and Const values) as file-level globals.
+    # Const globals are just referenced directly wherever they're used.
     for node in graph.nodes:
         if node.op == CONST:
             ident = ids[node.name]
@@ -552,19 +430,14 @@ def generate_cpp(graph: Graph, options: Optional[CodegenOptions] = None) -> str:
         lines.append("};")
         lines.append("")
 
-    # Three streams, assembled at the end:
-    #   prelude_lines  -- Input reads (run exactly once, never repeated).
-    #   decl_lines     -- sizing declarations for every other node's buffer,
-    #                     emitted once before the compute loop.
-    #   compute_lines  -- the actual per-node statements (assignments only,
-    #                     no declarations of the sized output buffers), run
-    #                     once per repetition inside the `compute` lambda.
+    # build three chunks and stitch them together at the end:
+    #   prelude  - read the inputs (once)
+    #   decl     - declare each node's buffer (once, before the loop)
+    #   compute  - the actual math (goes inside the repeat loop)
     prelude_lines: List[str] = []
     decl_lines: List[str] = []
     compute_lines: List[str] = []
-    # QuantizedLinear int8 scratch buffer declarations, tracked separately so
-    # they survive wholesale replacement of decl_lines under reuse_buffers=on
-    # -- they never participate in the double-precision buffer-reuse pool.
+    # int8 scratch buffers are kept separately - they don't go in the reuse pool
     quantized_scratch_decl_lines: List[str] = []
 
     for node in graph.nodes:
@@ -588,10 +461,7 @@ def generate_cpp(graph: Graph, options: Optional[CodegenOptions] = None) -> str:
             continue
 
         if node.op == CONST:
-            # Emitted as a global static array above; no decl-section entry
-            # and no compute statement -- downstream ops reference the
-            # global identifier directly.
-            continue
+            continue  # already a global, nothing to do here
 
         if node.op == LINEAR:
             src_ident = ids[node.inputs[0]]
@@ -759,10 +629,8 @@ def generate_cpp(graph: Graph, options: Optional[CodegenOptions] = None) -> str:
             raise ValueError(f"Unsupported op {node.op!r}")
 
     if reuse_buffers:
-        # Replace the per-node buffer declarations wholesale with physical
-        # slot declarations plus one reference per node; every compute
-        # statement above refers only to the per-node identifiers, so the
-        # compute stream needs no changes.
+        # swap the per-node decls for the packed-slot version. the compute code
+        # uses the per-node names either way so it doesn't care.
         decl_lines = _emit_reuse_decl_lines(
             graph, ids, buffer_assignment, buffer_slot_sizes
         )
@@ -841,22 +709,19 @@ def _emit_linear_like(
     openmp: bool,
     relu: bool,
 ) -> List[str]:
-    """Return compute-only statements for a Linear or FusedLinearReLU node.
+    """The C++ for a Linear (or FusedLinearReLU) node.
 
-    ``openmp`` always forces the naive j-outer form (even when ``tile_size``
-    is set): the loop-interchanged accumulation form below writes
-    ``ident[j] += ...`` from the *outer* ``i`` loop, so parallelizing over
-    ``i`` would race every thread on the same ``ident[j]`` slots. The naive
-    form's outer loop is over ``j``, and each ``j`` iteration only ever
-    touches its own ``ident[j]`` slot, so it is race-free to parallelize.
+    If openmp is on we always use the plain j-outer loop, even with tiling: the
+    interchanged version does `out[j] +=` from the outer i loop, so parallelizing
+    i would have threads stomping on the same out[j]. The j-outer loop gives each
+    j its own slot, so that one's safe to parallelize.
     """
     lines: List[str] = []
     assign = "std::max(0.0, acc)" if relu else "acc"
 
     if tile_size is not None and not openmp:
-        # Loop interchange: stream the weight matrix row-major (over i, then
-        # j) instead of the naive strided w[i * out_features + j] access
-        # pattern from the j-outer form.
+        # interchanged loops: walk the weights row-major (i then j) instead of the
+        # strided w[i*out + j] the j-outer version uses - nicer on the cache
         lines.append(f"for (int j = 0; j < {out_features}; ++j) {{")
         lines.append(f"    {ident}[j] = {ident}_b[j];")
         lines.append("}")
@@ -872,7 +737,7 @@ def _emit_linear_like(
             lines.append("}")
         return lines
 
-    # Naive j-outer form (default, and forced whenever openmp is requested).
+    # plain j-outer form (the default, and what openmp uses)
     if openmp:
         lines.append("#pragma omp parallel for")
     lines.append(f"for (int j = 0; j < {out_features}; ++j) {{")
@@ -892,21 +757,13 @@ def _emit_quantized_linear(
     out_features: int,
     relu: bool = False,
 ) -> List[str]:
-    """Return compute-only statements for a ``QuantizedLinear`` node (or, with
-    ``relu=True``, a ``QuantizedFusedLinearReLU`` node).
+    """The C++ for a QuantizedLinear node (or QuantizedFusedLinearReLU if relu=True).
 
-    Always plain loops -- ``CodegenOptions.tile_size``/``openmp`` apply only
-    to the float Linear/FusedLinearReLU/MatMul paths, never to quantized
-    inference (the int8 matmul here is intentionally not tiled/parallelized).
-
-    Mirrors :func:`tinynn.interpreter._eval_quantized_linear` exactly:
-    per-call activation quantization (dynamic ``s_x``), a plain int8 x int8
-    matmul accumulated into a 64-bit ``acc``, then one float rescale
-    (``sx * sw``) plus the float bias add. Rounding is round-half-away-from-
-    zero via ``std::lround`` (matches the interpreter's
-    ``sign(v) * floor(abs(v) + 0.5)``, NOT NumPy's round-half-to-even).
-    With ``relu=True`` the ReLU clamp is applied LAST, after the rescale and
-    bias add -- identical to the interpreter's QuantizedFusedLinearReLU.
+    Always plain loops - tiling/openmp are only for the float ops. Has to match
+    interpreter._eval_quantized_linear exactly: quantize the activations (dynamic
+    s_x), int8 x int8 matmul into a long long, then one rescale + bias. std::lround
+    rounds half away from zero, same as the interpreter. relu=True just adds a
+    max(0, ...) at the very end.
     """
     lines: List[str] = []
     lines.append("{")
@@ -958,7 +815,7 @@ def _emit_matmul(
     tile_size: Optional[int],
     openmp: bool,
 ) -> List[str]:
-    """Return compute-only statements for a MatMul node."""
+    """The C++ for a MatMul node."""
     lines: List[str] = []
 
     if tile_size is not None:
@@ -990,7 +847,7 @@ def _emit_matmul(
         lines.append("}")
         return lines
 
-    # Naive triple loop (unchanged from earlier tiers).
+    # plain triple loop
     if openmp:
         lines.append("#pragma omp parallel for")
     lines.append(f"for (int i = 0; i < {m}; ++i) {{")
@@ -1007,17 +864,12 @@ def _emit_matmul(
     return lines
 
 
-# --------------------------------------------------------------------------- #
-# Compiler driver
-# --------------------------------------------------------------------------- #
 @dataclass
 class CompiledModel:
-    """A compiled TinyNN graph: the generated C++ source and its binary.
+    """A compiled graph - the .cpp file and the binary, plus what it expects.
 
-    ``input_specs`` records each Input node's name and declared shape, in
-    graph order (the same order the generated binary reads them from
-    stdin). ``output_shape`` is the declared shape of ``graph.output_node``,
-    used to reshape the binary's flat stdout output before returning it.
+    input_specs is each Input's (name, shape) in the order the binary reads them
+    from stdin; output_shape is used to reshape the flat stdout back.
     """
 
     cpp_path: Path
@@ -1026,21 +878,10 @@ class CompiledModel:
     input_specs: Tuple[Tuple[str, Tuple[int, ...]], ...]
 
     def run(self, inputs) -> np.ndarray:
-        """Run the compiled binary on ``inputs`` and return the output.
+        """Run the binary once on inputs and return the output (reshaped).
 
-        ``inputs`` may be a ``dict`` mapping every Input node's name to an
-        array-like value, or a bare array/array-like -- the latter is only
-        accepted when the model has exactly one Input node (this keeps
-        single-input, 1D-output models call-compatible with earlier tiers).
-
-        Each input value is converted to float64 and must have exactly as
-        many elements as its Input node's declared shape; values are
-        flattened row-major and concatenated, in graph order, to build the
-        binary's stdin. The binary's stdout is parsed as a flat float64
-        array and reshaped to ``output_shape`` before being returned.
-
-        The binary is invoked with no arguments, i.e. ``iters=1, warmup=0``
-        -- exactly the same single computation as earlier tiers.
+        inputs is a {name: array} dict, or a bare array if there's one Input.
+        Each value gets flattened and piped to stdin in graph order.
         """
         stdin_text = self._stdin_text(inputs)
 
@@ -1066,15 +907,10 @@ class CompiledModel:
         return self._parse_stdout(proc.stdout, proc.stderr)
 
     def benchmark(self, inputs, iters: int = 100, warmup: int = 10) -> float:
-        """Run the compiled binary ``iters`` timed repetitions and return seconds/iter.
+        """Time the binary and return seconds per iteration.
 
-        Invokes the binary as ``<binary> <iters> <warmup>`` with the same
-        stdin as :meth:`run`. The binary runs ``warmup`` untimed
-        repetitions of the compute, then ``iters`` timed repetitions,
-        printing ``BENCH_NS <total_ns> CHECKSUM <checksum>`` to stderr (in
-        addition to its normal stdout output, from the final repetition).
-        Returns ``total_ns / iters / 1e9`` -- wall-clock seconds per
-        iteration.
+        Runs it as `<binary> <iters> <warmup>`; the binary does warmup reps, then
+        times iters reps and prints BENCH_NS to stderr. We divide that by iters.
         """
         stdin_text = self._stdin_text(inputs)
 
@@ -1110,7 +946,7 @@ class CompiledModel:
         return total_ns / int(iters) / 1e9
 
     def _stdin_text(self, inputs) -> str:
-        """Build the flat, whitespace-separated stdin text for ``inputs``."""
+        # flatten all the inputs into one space-separated line for stdin
         provided = self._resolve_inputs(inputs)
 
         parts: List[np.ndarray] = []
@@ -1159,7 +995,7 @@ class CompiledModel:
         return np.array(values, dtype=np.float64).reshape(self.output_shape)
 
     def _resolve_inputs(self, inputs) -> Dict[str, np.ndarray]:
-        """Normalize ``inputs`` (dict or bare array) to a ``name -> value`` dict."""
+        # turn a bare array into a {name: array} dict when there's one input
         if isinstance(inputs, dict):
             missing = [name for name, _ in self.input_specs if name not in inputs]
             if missing:
@@ -1187,31 +1023,11 @@ def compile_graph(
     extra_flags: Optional[List[str]] = None,
     options: Optional[CodegenOptions] = None,
 ) -> CompiledModel:
-    """Generate C++ for ``graph``, compile it, and return a :class:`CompiledModel`.
+    """Generate the C++, compile it with g++, and hand back a CompiledModel.
 
-    Parameters
-    ----------
-    graph:
-        The Graph IR to compile. Must have at least one Input node and only
-        1D or 2D node shapes (see :func:`generate_cpp`).
-    output_dir:
-        Directory to write the generated ``.cpp`` file and the compiled
-        binary into. Created (with parents) if it does not exist.
-    binary_name / cpp_name:
-        File names (not paths) for the compiled binary and generated source.
-    compiler:
-        Compiler executable to invoke (default ``"g++"``).
-    extra_flags:
-        Additional flags appended to the compiler invocation, after the
-        optimization flags derived from ``options`` (or ``-O2`` when
-        ``options`` is ``None``).
-    options:
-        Optional :class:`CodegenOptions`. ``None`` (the default) reproduces
-        the exact naive codegen and ``-O2`` compile flags of earlier tiers.
-        When given, ``options.opt_level`` replaces ``-O2``, ``-march=native``
-        is added when ``options.native``, and ``-fopenmp`` is added when
-        ``options.openmp`` (callers should check :func:`openmp_available`
-        first -- this function does not check for them).
+    output_dir gets the .cpp and the binary (created if missing). options=None
+    means plain -O2 codegen; otherwise the flags come from options (opt_level,
+    -march=native, -fopenmp). extra_flags get tacked on the end.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
