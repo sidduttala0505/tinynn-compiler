@@ -1,9 +1,7 @@
-"""TinyNN: a tiny compiler for simple neural networks.
+"""TinyNN - a little compiler for small neural nets.
 
-Exposes the shared Graph IR, the NumPy reference interpreter (the project's
-correctness oracle), the C++ code generator / compiler driver, optimization
-passes, and graph tooling (topological sort, shape inference, JSON
-serialization, Graphviz DOT export).
+Pulls the useful stuff up to the top level: the graph IR, the interpreter, the
+C++ codegen, the passes, and the graph tools (toposort, shapes, JSON, dot).
 """
 
 from __future__ import annotations
