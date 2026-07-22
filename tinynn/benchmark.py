@@ -1,19 +1,12 @@
-"""Benchmark harness: interpreter vs naive C++ vs optimized C++.
+"""Benchmarking: interpreter vs naive C++ vs optimized C++.
 
-Correctness always precedes timing: every compiled variant is verified
-against the NumPy reference interpreter (the project's correctness oracle)
-before a single measurement is taken, and :func:`benchmark_graph` raises if
-any variant disagrees.
+We check every compiled version against the interpreter first and bail if they
+disagree - no point timing a wrong answer. The C++ timing happens inside the
+binary (so we're not measuring process startup); the interpreter is timed here
+with perf_counter. Numbers depend a lot on the machine, so don't read too much
+into them.
 
-Timing methodology: compiled variants are timed *inside* the generated
-binary (see the repeat/warmup mode in :mod:`tinynn.codegen`), so Python
-subprocess startup is not measured. The interpreter is timed in-process
-with ``time.perf_counter``. Numbers are machine- and load-dependent;
-treat them as indicative, not authoritative.
-
-Run the representative workloads with:
-
-    ./venv/bin/python -m tinynn.benchmark
+Run it with:  ./venv/bin/python -m tinynn.benchmark
 """
 
 from __future__ import annotations
@@ -36,7 +29,7 @@ __all__ = ["benchmark_graph"]
 
 Inputs = Union[Dict[str, np.ndarray], np.ndarray]
 
-# Verification tolerance applied before any timing.
+# how close the compiled output has to be to the interpreter before we time it
 _RTOL = _ATOL = 1e-9
 
 
@@ -50,7 +43,7 @@ def _verify(label: str, actual: np.ndarray, expected: np.ndarray) -> None:
 
 
 def _time_interpreter(graph: Graph, inputs: Inputs, iters: int) -> float:
-    for _ in range(3):  # warmup
+    for _ in range(3):  # warm up first
         run(graph, inputs)
     start = time.perf_counter()
     for _ in range(iters):
@@ -66,16 +59,11 @@ def benchmark_graph(
     results_dir: Union[str, Path] = "results",
     label: str = "benchmark",
 ) -> Dict[str, object]:
-    """Benchmark ``graph``: interpreter vs naive C++ vs optimized C++.
+    """Benchmark a graph three ways: interpreter, plain C++, optimized C++.
 
-    "Optimized" means the graph is first run through the default pass
-    pipeline (DCE + Linear/ReLU fusion) and then compiled with
-    ``CodegenOptions.fast()`` (``-O3 -march=native`` + loop
-    interchange/tiling), with OpenMP enabled iff the compiler supports it.
-
-    Verifies every compiled variant against the interpreter before timing,
-    writes ``<label>.json`` and ``<label>.md`` into ``results_dir``, and
-    returns the result dict.
+    "Optimized" = run the default pipeline first, then compile with
+    CodegenOptions.fast() (and OpenMP if we have it). Checks correctness first,
+    writes <label>.json and <label>.md into results_dir, and returns the dict.
     """
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -155,9 +143,7 @@ def benchmark_graph(
     return result
 
 
-# --------------------------------------------------------------------------- #
-# Representative workloads (python -m tinynn.benchmark)
-# --------------------------------------------------------------------------- #
+# a couple of example workloads to run when called directly
 def _mlp_256() -> Dict[str, object]:
     rng = np.random.default_rng(0)
     b = GraphBuilder()
