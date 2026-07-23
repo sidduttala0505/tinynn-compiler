@@ -1,54 +1,19 @@
-"""ONNX importer for the TinyNN Graph IR (optional feature).
+"""Load a small ONNX model into a TinyNN graph. Optional - needs `pip install onnx`.
 
-``import_onnx`` converts a small, MLP-style ONNX model into a
-:class:`tinynn.graph.Graph`. The ``onnx`` package is imported lazily inside
-:func:`import_onnx`, so this module (and the rest of TinyNN) works fine
-without ``onnx`` installed; install it with ``pip install onnx`` to use the
-importer.
+Only handles simple MLP-ish models with 1D activations. onnx is imported lazily
+inside import_onnx so the rest of TinyNN doesn't depend on it.
 
-Scope
------
-Batchless MLP-style models operating on 1D activations:
+What maps to what:
+  Gemm     -> Linear   (weight/bias are initializers; transB=1 transposes;
+                        alpha/beta must be 1, transA must be 0)
+  MatMul   -> Linear (zero bias) if the 2nd arg is a 2D initializer,
+              or MatMul if both args are 2D activations
+  Relu/Tanh/Sigmoid/Softmax/Add/Sub/Mul -> the obvious thing
+  Identity -> just an alias, no node
 
-* **Graph inputs**: every ONNX graph input that is *not* an initializer
-  becomes a TinyNN ``Input`` node. Input shapes must have concrete integer
-  dims. Shape ``(N,)`` is accepted as-is and a leading batch dim of exactly 1
-  is squeezed (``(1, N) -> (N,)``). Anything else -- symbolic dims, a batch
-  dim other than 1, rank > 2 -- is rejected with a ``ValueError`` naming the
-  offending tensor.
-* **Initializers** are loaded via ``onnx.numpy_helper.to_array`` and cast to
-  float64. They are *not* graph inputs and may only appear as Gemm/MatMul
-  weight/bias operands; any other use raises ``ValueError`` about
-  "unsupported initializer usage".
-* **Supported ONNX ops** and their TinyNN mapping:
-
-  ========  =====================================================
-  ONNX      TinyNN
-  ========  =====================================================
-  Gemm      ``Linear`` (A=activation, B=initializer weight,
-            C=initializer bias or absent -> zeros; requires
-            ``alpha == 1``, ``beta == 1``, ``transA == 0``;
-            ``transB == 1`` transposes the weight to ``(in, out)``)
-  MatMul    ``Linear`` with zero bias when the second operand is a
-            2D initializer; ``MatMul`` when both operands are 2D
-            activations
-  Relu      ``ReLU``
-  Tanh      ``Tanh``
-  Sigmoid   ``Sigmoid``
-  Softmax   ``Softmax`` (1D activation; axis must be -1 or 0)
-  Add       ``Add`` (two same-shape activations)
-  Sub       ``Sub`` (two same-shape activations)
-  Mul       ``Mul`` (two same-shape activations)
-  Identity  alias only -- no TinyNN node is created
-  ========  =====================================================
-
-  Any other op type raises a ``ValueError`` naming the unsupported op.
-* **Outputs**: single-output models only; ``graph.output[0]``'s producing
-  node becomes the TinyNN graph's ``output_node``.
-
-TinyNN node names are the ONNX output tensor names, used verbatim. Nodes are
-processed in the order they appear in the ONNX graph (which the ONNX spec
-requires to be topologically sorted).
+A (1, N) input gets its batch dim of 1 squeezed to (N,). Anything weirder
+(symbolic dims, batch != 1, rank > 2, unsupported ops, multiple outputs) raises.
+TinyNN node names are just the ONNX output tensor names.
 """
 
 from __future__ import annotations
@@ -62,31 +27,11 @@ from .graph import Graph, GraphBuilder
 
 
 def import_onnx(model: Any) -> Graph:
-    """Convert an ONNX model into a TinyNN :class:`~tinynn.graph.Graph`.
-
-    Parameters
-    ----------
-    model:
-        Either a path (``str`` or ``pathlib.Path``) to a ``.onnx`` file, or
-        an already-loaded ``onnx.ModelProto``.
-
-    Returns
-    -------
-    Graph
-        A validated TinyNN graph equivalent to the ONNX model.
-
-    Raises
-    ------
-    ImportError
-        If the ``onnx`` package is not installed.
-    ValueError
-        If the model uses unsupported ops, shapes, or attribute values (see
-        the module docstring for the supported subset).
-    """
+    """Turn an ONNX model (a path or a loaded ModelProto) into a TinyNN Graph."""
     try:
         import onnx
         from onnx import numpy_helper
-    except ImportError as exc:  # pragma: no cover - exercised only w/o onnx
+    except ImportError as exc:  # pragma: no cover - only hit without onnx
         raise ImportError(
             "The 'onnx' package is required for tinynn.onnx_import.import_onnx; "
             "install it with `pip install onnx`."
@@ -101,17 +46,15 @@ def import_onnx(model: Any) -> Graph:
 
     onnx_graph = model.graph
 
-    # Initializers: name -> float64 ndarray. Not graph inputs.
+    # the weights/biases (name -> array). these aren't graph inputs.
     initializers: Dict[str, np.ndarray] = {
         init.name: np.asarray(numpy_helper.to_array(init), dtype=np.float64)
         for init in onnx_graph.initializer
     }
 
     builder = GraphBuilder()
-    # ONNX tensor name -> TinyNN node name (Identity creates aliases here).
-    tensor_map: Dict[str, str] = {}
-    # ONNX tensor name -> shape of the activation it denotes.
-    shapes: Dict[str, Tuple[int, ...]] = {}
+    tensor_map: Dict[str, str] = {}  # onnx tensor name -> our node name (Identity aliases)
+    shapes: Dict[str, Tuple[int, ...]] = {}  # onnx tensor name -> its shape
 
     for value_info in onnx_graph.input:
         if value_info.name in initializers:
@@ -138,12 +81,8 @@ def import_onnx(model: Any) -> Graph:
     return builder.build(output_node=tensor_map[out_name])
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
 def _input_shape(value_info: Any) -> Tuple[int, ...]:
-    """Extract a concrete 1D shape from an ONNX graph input, squeezing a
-    leading batch dim of exactly 1."""
+    # pull out the shape, dropping a leading batch dim of 1 if there is one
     name = value_info.name
     tensor_type = value_info.type.tensor_type
     dims = []
@@ -183,7 +122,7 @@ def _activation(
     tensor_map: Dict[str, str],
     initializers: Dict[str, np.ndarray],
 ) -> str:
-    """Resolve an operand that must be an activation (not an initializer)."""
+    # look up an operand that should be an activation, not a weight
     if tensor_name in initializers:
         raise ValueError(
             f"unsupported initializer usage: {node.op_type} node "
@@ -353,7 +292,7 @@ def _import_matmul(
         shapes[out] = (int(weight.shape[1]),)
         return
 
-    # Two activations: only 2D x 2D is supported.
+    # two activations - only 2D @ 2D
     a = _activation(a_name, node, tensor_map, initializers)
     b = _activation(b_name, node, tensor_map, initializers)
     a_shape, b_shape = shapes[a_name], shapes[b_name]
