@@ -1,14 +1,7 @@
-"""End-to-end TinyNN demo: build -> interpret -> optimize -> compile -> verify.
+"""Little end-to-end demo: build a graph, run it, optimize it, compile it, check
+they all agree. Also dumps a JSON snapshot and some dot files.
 
-Builds a small 2-layer MLP with a deliberately dead branch, runs it through
-the NumPy interpreter (the correctness oracle), optimizes it with the default
-pass pipeline (dead code elimination + Linear/ReLU fusion), compiles the
-optimized graph to a native binary via the C++ backend, and checks that every
-path agrees. Also writes a JSON snapshot and Graphviz DOT files.
-
-Run from the repo root:
-
-    ./venv/bin/python examples/mlp_demo.py
+Run it:  ./venv/bin/python examples/mlp_demo.py
 """
 
 from __future__ import annotations
@@ -34,7 +27,7 @@ OUT_DIR = Path(__file__).resolve().parent / "out"
 
 
 def build_graph():
-    """A 4 -> 8 -> 3 MLP with an extra dead Linear branch off the input."""
+    # a 4 -> 8 -> 3 MLP, plus a dead branch so DCE has something to remove
     rng = np.random.default_rng(0)
     b = GraphBuilder()
     x = b.input("x", shape=(4,))
@@ -43,7 +36,7 @@ def build_graph():
     h = b.relu("relu_0", h)
     y = b.linear("linear_1", h, weight=rng.standard_normal((8, 3)),
                  bias=rng.standard_normal(3))
-    # Dead branch: computed by nothing downstream; DCE should remove it.
+    # nothing uses this one - DCE should drop it
     b.linear("dead_linear", x, weight=rng.standard_normal((4, 5)),
              bias=rng.standard_normal(5))
     b.output("y", y)
