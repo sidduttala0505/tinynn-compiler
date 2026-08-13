@@ -130,7 +130,9 @@ source-inspection test — and int8 weights baked in as `static const int8_t`.
 **CUDA backend.** A deliberately narrow, honest vertical slice rather than full GPU support.
 It generates CUDA C++, compiles it with `nvcc`, runs real kernels on an NVIDIA GPU, and
 compares the output against the interpreter oracle. It covers 1D `Input` / `Linear` /
-`ReLU` / `Output`, and its tests skip cleanly when no compiler, runtime, or GPU is present.
+`FusedLinearReLU` / `ReLU` / `Output`. A fused node emits one linear-plus-ReLU kernel
+and does not materialize a pre-ReLU activation buffer. Its tests skip cleanly when no
+compiler, runtime, or GPU is present.
 
 ## Testing
 
@@ -154,6 +156,21 @@ python -m pytest tests -k "not cuda"   # CPU-only
 Backend tests are conditional on your toolchain: C++ tests need `g++`, embedded-C tests
 need a C/C++ compiler, ONNX tests need the optional `onnx` package, and CUDA tests need
 `nvcc` plus a working GPU.
+
+### CUDA steady-state benchmark
+
+On an NVIDIA host, run:
+
+```bash
+python -m tinynn.cuda_benchmark --results-dir results/cuda --iters 10000 --warmup 1000
+```
+
+The harness verifies each workload against the NumPy interpreter before timing a deterministic
+`256 -> 512 -> 512 -> 10` MLP and the repository's `examples/models/digits_mlp.onnx`.
+It performs parameter/input uploads and device allocation once, warms up, then reports
+CUDA-event seconds per inference for device kernel execution only. It deliberately excludes
+process startup, file I/O, transfer time, and one-time setup, and makes no cross-framework
+speedup claim.
 
 ## Benchmarks
 
