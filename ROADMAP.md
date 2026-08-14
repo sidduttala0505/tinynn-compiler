@@ -48,13 +48,18 @@
       liveness-based exact-size slot planner; e.g. 5 logical buffers -> 2
       physical slots on an MLP chain)
 
-## Tier 5 — GPU (minimal vertical slice)
+## Tier 5 — GPU (optimized MLP vertical slice)
 
-- [x] Minimal CUDA backend vertical slice (`tinynn/cuda.py`): 1D Input /
-      Linear / ReLU / Output graphs compile with `nvcc`, execute CUDA kernels
-      on a usable NVIDIA GPU, and compare against the interpreter oracle.
-      `tests/test_cuda.py` skips cleanly when the CUDA compiler or runtime/GPU
-      is unavailable. Broader op coverage remains future work.
+- [x] CUDA MLP backend (`tinynn/cuda.py`): 1D Input / Linear /
+      FusedLinearReLU / ReLU / Output graphs compile with `nvcc`, execute CUDA
+      kernels on a usable NVIDIA GPU, and compare against the interpreter oracle.
+      A fused Linear-ReLU emits one kernel and avoids a pre-ReLU activation
+      allocation. `tests/test_cuda.py` runs source tests everywhere and skips
+      only hardware execution when the CUDA compiler or runtime/GPU is unavailable.
+- [x] Steady-state CUDA benchmark harness (`tinynn/cuda_benchmark.py`): one-time
+      setup and warmup followed by CUDA-event device timing for a representative
+      MLP and the checked-in digits MLP; results document excluded setup/transfer
+      work and do not assert hardware-dependent speedups.
 
 ## Tier 6 — Interchange / quantization (mostly complete)
 
